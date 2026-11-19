@@ -97,7 +97,7 @@ under your home (the skill does this for you):
 
 ```bash
 git worktree add --detach ~/scratch/wt/review <commit>
-ln -s <clone>/mslk/mslk.so ~/scratch/wt/review/mslk/mslk.so   # reuse your build if C++ is unchanged
+ln -sr <clone>/mslk/mslk.so ~/scratch/wt/review/mslk/mslk.so   # reuse your build if C++ is unchanged
 ```
 
 Check its findings before acting on them: it separates reproduced from
@@ -116,7 +116,11 @@ eval/setup_case.sh <case> <mslk-clone> ~/scratch/eval/<case>
 
 Then run the reviewer on the printed range with that worktree, without hints
 and without showing it the answer key, and score its report against
-`eval/<case>/answer_key.md`.
+`eval/<case>/answer_key.md`. Your clone may hold later commits that fix the
+case's problems; the reviewer is told not to use commits outside the range,
+but check its report did not rely on them. For an unattended run, e.g.
+`claude -p "/mslk-rocm-review:review <range> ..."`, allow the tools it needs
+and its probe directory (`--allowedTools ...`, `--add-dir <probe dir>`).
 
 | Case | Known problems |
 |---|---|

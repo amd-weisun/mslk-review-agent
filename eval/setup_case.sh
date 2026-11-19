@@ -16,7 +16,9 @@ git -C "$clone" cat-file -e "$base^{commit}" 2>/dev/null \
 git -C "$clone" worktree add --detach "$dest" "$base"
 git -C "$dest" -c user.name=eval -c user.email=eval@localhost am -q "$case_dir"/patches/*.patch
 if [ -e "$clone/mslk/mslk.so" ]; then
-  ln -s "$(cd "$clone" && pwd)/mslk/mslk.so" "$dest/mslk/mslk.so"
+  # Relative, so it resolves in the container too when the clone and the
+  # worktree are both under your mounted home.
+  ln -sr "$clone/mslk/mslk.so" "$dest/mslk/mslk.so"
 fi
 echo "Review range: $base..$(git -C "$dest" rev-parse --short HEAD) in $dest"
 echo "Answer key (do not show the reviewer): $case_dir/answer_key.md"

@@ -25,7 +25,9 @@ Work from what the prompt gives and from upstream MSLK (the repository's
 history and merged code). Use every reference the prompt names: PRs, commits,
 files, tickets, design notes, earlier reviews. Do not assume knowledge of
 unmerged work or of anything outside the repository unless the prompt points
-to it.
+to it. Judge the change as it stands: do not search other branches or later
+commits for fixes or context, and do not cite them, unless the prompt names
+them as references.
 
 If something that would change the review is missing (the base commit, the
 target arch, what the change claims, the integration or PR it follows, the

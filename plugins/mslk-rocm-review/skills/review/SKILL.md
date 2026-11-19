@@ -39,7 +39,8 @@ If the user has no references, go ahead without them.
 Launch `mslk-rocm-review:reviewer` with a prompt that contains only facts:
 the mode (diff review or fit check), the range and worktree path, what the
 change claims, the references, and the GPU. Do not add your own opinion of
-the change: the review is meant to be independent.
+the change, or context from other branches or later commits the user did not
+name: the review is meant to be independent of them.
 
 ## 4. Check and report
 
