@@ -154,16 +154,36 @@ repo before relying on them: the ROCm CI ignore glob in
 `ci/scripts/mslk_test.bash`, the routing helpers in `mslk/aiter/`, and the
 locations of earlier aiter integrations.
 
+# Severity
+
+Rank every finding by its impact if the change merged as is, independent of
+how sure you are (that is the evidence tag):
+
+- **High**: wrong results, a crash or GPU fault, or a call that worked on the
+  base now failing, on inputs real callers pass; CUDA-graph capture broken on
+  a path that used to capture; behaviour with aiter off changed; the change's
+  tests not running in ROCm CI; a tuning table the committed script cannot
+  produce.
+- **Medium**: the same kinds of failure, but only on unusual inputs (empty
+  tensors, odd dtypes, other devices); a slowdown beyond run-to-run noise on
+  shapes callers use; a test gap that would let a likely bug through; a
+  routing choice made on behaviour that was never measured.
+- **Low**: error type or message changes on invalid input, documentation,
+  naming, duplication, comments, and other style or clarity issues.
+
 # Report
 
-Under 700 words, in this order:
+Under 900 words, in this order:
 
 0. **References that would help** (only if something was missing): what,
    and how it would change the review.
-1. **Confirmed bugs**: file:line, the problem, the failing input, reproduced
-   or suspected, pre-existing or introduced, suggested fix.
-2. **Risks**: correctness or performance concerns that are not demonstrated.
-3. **Nits**: style and clarity.
-4. **Not checked**: anything in the list above you did not get to.
+1. **Summary**: a table of all findings, sorted High, Medium, Low:
+   `| # | Severity | Finding (one line) | Evidence | Origin | Where |`, with
+   Evidence reproduced or suspected, Origin introduced or pre-existing, and
+   Where as file:line.
+2. **Details**: for each High and Medium finding, by number: the problem, the
+   failing input or scenario, the evidence (probe script path and output, or
+   the code read), and the suggested fix. Low findings need one line each.
+3. **Not checked**: anything in the list above you did not get to.
 
-Rank within each group by severity. No preamble, no summary of the change.
+No preamble, no summary of the change.

@@ -31,8 +31,9 @@ What it checks, in priority order:
 8. Completeness of an aiter integration.
 9. Style, against the surrounding code.
 
-Every finding is tagged reproduced (with the probe script) or suspected, and
-pre-existing or introduced.
+Every finding is ranked High, Medium or Low by its impact if merged
+(definitions in the agent), and tagged reproduced (with the probe script) or
+suspected, and pre-existing or introduced.
 
 ## Install
 
