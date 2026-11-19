@@ -128,8 +128,10 @@ to fix instead of guessing.
 - Dev container `${user_config.container}`; repo at
   `${user_config.repo_in_container}` and host home at
   `${user_config.home_in_container}` inside it. Run Python as
-  `docker exec -e HIP_VISIBLE_DEVICES=<gpu> ${user_config.container} bash -lc '${user_config.python_setup}; cd ${user_config.repo_in_container}; ...'`.
-  Host Python usually has no torch.
+  `docker exec -e HIP_VISIBLE_DEVICES=<gpu> -e PYTHONDONTWRITEBYTECODE=1 ${user_config.container} bash -lc '${user_config.python_setup}; cd ${user_config.repo_in_container}; ...'`.
+  Host Python usually has no torch. Keep `PYTHONDONTWRITEBYTECODE=1` on every
+  run: Python in a root container would leave root-owned `__pycache__`
+  directories in the user's worktrees.
 - GPUs are shared: check `docker exec ${user_config.container} amd-smi metric --usage`
   and use only a GPU with ~0% GFX activity; use the GPU the prompt names if
   it names one. Never run tuning scripts or anything long.
