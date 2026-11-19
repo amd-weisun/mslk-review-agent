@@ -1,0 +1,12 @@
+{
+  "name": "mslk-rocm-tools",
+  "description": "Claude Code tools for working on MSLK on AMD GPUs (ROCm)",
+  "owner": { "name": "amd-weisun" },
+  "plugins": [
+    {
+      "name": "mslk-rocm-review",
+      "source": "./plugins/mslk-rocm-review",
+      "description": "Independent, read-only reviewer for MSLK changes on the ROCm side"
+    }
+  ]
+}

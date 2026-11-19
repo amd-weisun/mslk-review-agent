@@ -1,0 +1,1627 @@
+From c609c5d867856e1a090d2f6416eee5dec2888cdb Mon Sep 17 00:00:00 2001
+From: amd-weisun <Wei.Sun@amd.com>
+Date: Wed, 18 Nov 2026 12:49:02 +0000
+Subject: [PATCH] Serve the BF16 grouped GEMM forward and dgrad ops from aiter
+ on ROCm where it is faster
+
+Route mslk::bf16bf16bf16_grouped_stacked and mslk::bf16bf16bf16_grouped_grad
+through the shared per-shape routing (#573), as f4f4bf16 does (#574), with
+aiter's Triton gmm as the second backend. gmm takes both ops' arguments as
+free views, and on every shape checked its outputs were bitwise identical to
+MSLK's kernels'.
+
+- Adapters (mslk/gemm/aiter/): stacked passes W [G, N, K] as
+  W.transpose(1, 2), gmm's unambiguous transposed layout (as is, gmm rejects
+  K == N); dgrad passes W.permute(0, 2, 1), gmm's non-transposed layout.
+  num_sms becomes grid_dim.
+- Routing (mslk/gemm/dispatch/): key (G, N, K), bucketed on total rows M.
+  aiter takes non-empty BF16 calls with the expected strides and an exactly
+  sized output, and for dgrad K != N; other calls use MSLK's kernel.
+- Tuning scripts, shape lists (MoE layers of public models; uneven group
+  sizes) and tuned tables for gfx950. aiter serves 17 of 176 stacked rows
+  (1.04x-1.30x) and 20 of 170 dgrad rows (1.06x-1.40x), all at M >= 2048.
+- Tests: both ops' unit tests run under the routing and with each backend
+  forced, including shapes routed to aiter and K == N; dispatch_test.py and
+  lazy_import_test.py cover the new modules.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bench/aiter/tune_bf16bf16bf16_grouped_grad.py |  93 +++++++++
+ .../tune_bf16bf16bf16_grouped_stacked.py      |  99 +++++++++
+ .../untuned/bf16bf16bf16_grouped_grad.csv     | 186 +++++++++++++++++
+ .../untuned/bf16bf16bf16_grouped_stacked.csv  | 193 ++++++++++++++++++
+ mslk/gemm/__init__.py                         |  12 +-
+ mslk/gemm/aiter/bf16bf16bf16_grouped_grad.py  |  41 ++++
+ .../aiter/bf16bf16bf16_grouped_stacked.py     |  41 ++++
+ .../dispatch/bf16bf16bf16_grouped_grad.py     | 105 ++++++++++
+ .../dispatch/bf16bf16bf16_grouped_stacked.py  |  85 ++++++++
+ .../tables/bf16bf16bf16_grouped_grad.csv      | 171 ++++++++++++++++
+ .../tables/bf16bf16bf16_grouped_stacked.csv   | 177 ++++++++++++++++
+ mslk/gemm/triton/grouped_gemm.py              |   7 +-
+ test/aiter/lazy_import_test.py                |   4 +
+ test/gemm/dispatch_test.py                    |  41 +++-
+ test/gemm/gemm_test.py                        | 159 ++++++++++++++-
+ 15 files changed, 1405 insertions(+), 9 deletions(-)
+ create mode 100644 bench/aiter/tune_bf16bf16bf16_grouped_grad.py
+ create mode 100644 bench/aiter/tune_bf16bf16bf16_grouped_stacked.py
+ create mode 100644 bench/aiter/untuned/bf16bf16bf16_grouped_grad.csv
+ create mode 100644 bench/aiter/untuned/bf16bf16bf16_grouped_stacked.csv
+ create mode 100644 mslk/gemm/aiter/bf16bf16bf16_grouped_grad.py
+ create mode 100644 mslk/gemm/aiter/bf16bf16bf16_grouped_stacked.py
+ create mode 100644 mslk/gemm/dispatch/bf16bf16bf16_grouped_grad.py
+ create mode 100644 mslk/gemm/dispatch/bf16bf16bf16_grouped_stacked.py
+ create mode 100644 mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_grad.csv
+ create mode 100644 mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_stacked.csv
+
+diff --git a/bench/aiter/tune_bf16bf16bf16_grouped_grad.py b/bench/aiter/tune_bf16bf16bf16_grouped_grad.py
+new file mode 100644
+index 0000000..9d98efe
+--- /dev/null
++++ b/bench/aiter/tune_bf16bf16bf16_grouped_grad.py
+@@ -0,0 +1,93 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Tune which backend serves ``mslk::bf16bf16bf16_grouped_grad`` on ROCm, per shape.
++
++Compares MSLK's Triton dgrad kernel with aiter's Triton ``gmm`` on every shape
++in ``bench/aiter/untuned/bf16bf16bf16_grouped_grad.csv`` and updates
++``mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_grad.csv``. The tuning itself
++(incremental runs, multi-GPU, timing, choosing) is :mod:`mslk.aiter.tuning`;
++this file holds only what is specific to the op. Needs the pinned aiter and a
++gfx950 GPU.
++
++The op is the input gradient of a grouped GEMM; ``W`` is passed as the
++``[G, N, K]`` view of a ``[G, K, N]`` weight. Group sizes, reference and
++tolerance are as in ``tune_bf16bf16bf16_grouped_stacked.py``.
++
++Example, on four GPUs (run from the repository root):
++
++    HIP_VISIBLE_DEVICES=0,1,2,3 python bench/aiter/tune_bf16bf16bf16_grouped_grad.py --mp 4
++"""
++
++from pathlib import Path
++from typing import Any, Dict
++
++import mslk.gemm  # noqa: F401  (registers mslk::bf16bf16bf16_grouped_grad)
++import torch
++from mslk.aiter import tuning
++from mslk.aiter.tuning import OpTuner, Row
++from mslk.gemm.dispatch.bf16bf16bf16_grouped_grad import BACKENDS, OP
++
++REPO = Path(__file__).resolve().parents[2]
++
++
++def uneven_group_sizes(M: int, G: int) -> torch.Tensor:
++    """Rows per group, summing to ``M``, skewed as MoE routing makes them: a
++    few groups take most rows, others few or none."""
++    weights = torch.rand(G, dtype=torch.float64).pow(3) + 1e-3
++    picks = torch.multinomial(weights, M, replacement=True)
++    return torch.bincount(picks, minlength=G)
++
++
++class BF16GroupedGradTuner(OpTuner):
++    op = OP
++    key_columns = ("G", "N", "K")
++    bucket_column = "M_max"
++    backends = BACKENDS
++    atol = rtol = 1e-2
++    outputs = ("out",)
++
++    def make_inputs(self, shape: Row) -> Dict[str, Any]:
++        M, G = int(shape["M_max"]), int(shape["G"])
++        N, K = int(shape["N"]), int(shape["K"])
++        M_sizes = uneven_group_sizes(M, G).to("cuda")
++        X = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
++        W = torch.randn(G, K, N, device="cuda", dtype=torch.bfloat16)
++        out = torch.empty(M * N, device="cuda", dtype=torch.bfloat16)
++        return {"X": X, "W": W, "M_sizes": M_sizes, "out": out}
++
++    def run(self, inputs: Dict[str, Any]) -> torch.Tensor:
++        return torch.ops.mslk.bf16bf16bf16_grouped_grad(
++            inputs["X"],
++            inputs["W"].permute(0, 2, 1),
++            inputs["M_sizes"],
++            inputs["out"],
++        )
++
++    def reference(self, shape: Row, inputs: Dict[str, Any]) -> torch.Tensor:
++        X, W = inputs["X"], inputs["W"]
++        out = torch.empty(X.shape[0], W.shape[2], device=X.device, dtype=torch.float32)
++        start = 0
++        for g, size in enumerate(inputs["M_sizes"].tolist()):
++            out[start : start + size] = X[start : start + size].float() @ W[g].float()
++            start += size
++        return out
++
++    def flops(self, shape: Row) -> float:
++        return 2.0 * int(shape["M_max"]) * int(shape["N"]) * int(shape["K"])
++
++    def bytes_moved(self, shape: Row) -> float:
++        M, G = int(shape["M_max"]), int(shape["G"])
++        N, K = int(shape["N"]), int(shape["K"])
++        return 2.0 * (M * K + G * N * K + M * N)
++
++
++if __name__ == "__main__":
++    tuning.main(
++        BF16GroupedGradTuner(),
++        untune_file=str(REPO / "bench/aiter/untuned/bf16bf16bf16_grouped_grad.csv"),
++        tune_file=str(REPO / "mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_grad.csv"),
++    )
+diff --git a/bench/aiter/tune_bf16bf16bf16_grouped_stacked.py b/bench/aiter/tune_bf16bf16bf16_grouped_stacked.py
+new file mode 100644
+index 0000000..4df9c07
+--- /dev/null
++++ b/bench/aiter/tune_bf16bf16bf16_grouped_stacked.py
+@@ -0,0 +1,99 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Tune which backend serves ``mslk::bf16bf16bf16_grouped_stacked`` on ROCm, per shape.
++
++Compares MSLK's FlyDSL grouped kernel with aiter's Triton ``gmm`` on every shape
++in ``bench/aiter/untuned/bf16bf16bf16_grouped_stacked.csv`` and updates
++``mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_stacked.csv``. The tuning
++itself (incremental runs, multi-GPU, timing, choosing) is
++:mod:`mslk.aiter.tuning`; this file holds only what is specific to the op. Needs
++the pinned aiter and a gfx950 GPU.
++
++Correctness: the reference is the FP32 product of the BF16 inputs, group by
++group, which the kernels match up to summation order and BF16 rounding, so the
++tolerance is tight (rtol = atol = 1e-2, aiter's default). Inputs are
++unit-scale, so outputs (about sqrt(K)) are far larger than atol at every K.
++
++Example, on four GPUs (run from the repository root):
++
++    HIP_VISIBLE_DEVICES=0,1,2,3 python bench/aiter/tune_bf16bf16bf16_grouped_stacked.py --mp 4
++"""
++
++from pathlib import Path
++from typing import Any, Dict
++
++import mslk.gemm  # noqa: F401  (registers mslk::bf16bf16bf16_grouped_stacked)
++import torch
++from mslk.aiter import tuning
++from mslk.aiter.tuning import OpTuner, Row
++from mslk.gemm.dispatch.bf16bf16bf16_grouped_stacked import BACKENDS, OP
++
++REPO = Path(__file__).resolve().parents[2]
++
++
++def uneven_group_sizes(M: int, G: int) -> torch.Tensor:
++    """Rows per group, summing to ``M``, skewed as MoE routing makes them: a
++    few groups take most rows, others few or none."""
++    weights = torch.rand(G, dtype=torch.float64).pow(3) + 1e-3
++    picks = torch.multinomial(weights, M, replacement=True)
++    return torch.bincount(picks, minlength=G)
++
++
++def grouped_reference(
++    X: torch.Tensor, W_nk: torch.Tensor, M_sizes: torch.Tensor
++) -> torch.Tensor:
++    """FP32 ``X[g] @ W_nk[g].T`` for each group ``g`` of the rows of ``X``."""
++    out = torch.empty(X.shape[0], W_nk.shape[1], device=X.device, dtype=torch.float32)
++    start = 0
++    for g, size in enumerate(M_sizes.tolist()):
++        out[start : start + size] = X[start : start + size].float() @ W_nk[g].float().T
++        start += size
++    return out
++
++
++class BF16GroupedStackedTuner(OpTuner):
++    op = OP
++    key_columns = ("G", "N", "K")
++    bucket_column = "M_max"
++    backends = BACKENDS
++    atol = rtol = 1e-2
++    outputs = ("out",)
++
++    def make_inputs(self, shape: Row) -> Dict[str, Any]:
++        M, G = int(shape["M_max"]), int(shape["G"])
++        N, K = int(shape["N"]), int(shape["K"])
++        M_sizes = uneven_group_sizes(M, G).to("cuda")
++        X = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
++        W = torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16)
++        out = torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
++        return {"X": X, "W": W, "M_sizes": M_sizes, "out": out}
++
++    def run(self, inputs: Dict[str, Any]) -> torch.Tensor:
++        return torch.ops.mslk.bf16bf16bf16_grouped_stacked(
++            inputs["X"], inputs["W"], inputs["M_sizes"], inputs["out"]
++        )
++
++    def reference(self, shape: Row, inputs: Dict[str, Any]) -> torch.Tensor:
++        return grouped_reference(inputs["X"], inputs["W"], inputs["M_sizes"])
++
++    def flops(self, shape: Row) -> float:
++        return 2.0 * int(shape["M_max"]) * int(shape["N"]) * int(shape["K"])
++
++    def bytes_moved(self, shape: Row) -> float:
++        M, G = int(shape["M_max"]), int(shape["G"])
++        N, K = int(shape["N"]), int(shape["K"])
++        return 2.0 * (M * K + G * N * K + M * N)
++
++
++if __name__ == "__main__":
++    tuning.main(
++        BF16GroupedStackedTuner(),
++        untune_file=str(REPO / "bench/aiter/untuned/bf16bf16bf16_grouped_stacked.csv"),
++        tune_file=str(
++            REPO / "mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_stacked.csv"
++        ),
++    )
+diff --git a/bench/aiter/untuned/bf16bf16bf16_grouped_grad.csv b/bench/aiter/untuned/bf16bf16bf16_grouped_grad.csv
+new file mode 100644
+index 0000000..fb9dae2
+--- /dev/null
++++ b/bench/aiter/untuned/bf16bf16bf16_grouped_grad.csv
+@@ -0,0 +1,186 @@
++# Shapes tuned for mslk::bf16bf16bf16_grouped_grad; each row becomes one row of its tuning table.
++# G is the number of groups (experts on one GPU), W the [G, N, K] view of the forward weight
++# [G, K, N], and M_max the bucket bound on total rows (tokens x top-k) across groups.
++# Initial list: the input gradients of the forward layers in bf16bf16bf16_grouped_stacked.csv
++# (N and K swapped), except those with N == K, which aiter cannot take. M = 1, 2, 4, ..., 65536.
++G,N,K,M_max
++# DeepSeek-V3/R1, 256 experts over 8 GPUs: gate+up
++32,7168,4096,1
++32,7168,4096,2
++32,7168,4096,4
++32,7168,4096,8
++32,7168,4096,16
++32,7168,4096,32
++32,7168,4096,64
++32,7168,4096,128
++32,7168,4096,256
++32,7168,4096,512
++32,7168,4096,1024
++32,7168,4096,2048
++32,7168,4096,4096
++32,7168,4096,8192
++32,7168,4096,16384
++32,7168,4096,32768
++32,7168,4096,65536
++# DeepSeek-V3/R1, 256 experts over 8 GPUs: down
++32,2048,7168,1
++32,2048,7168,2
++32,2048,7168,4
++32,2048,7168,8
++32,2048,7168,16
++32,2048,7168,32
++32,2048,7168,64
++32,2048,7168,128
++32,2048,7168,256
++32,2048,7168,512
++32,2048,7168,1024
++32,2048,7168,2048
++32,2048,7168,4096
++32,2048,7168,8192
++32,2048,7168,16384
++32,2048,7168,32768
++32,2048,7168,65536
++# Llama 4 Scout (16 experts) / Maverick (128 over 8 GPUs): gate+up
++16,5120,16384,1
++16,5120,16384,2
++16,5120,16384,4
++16,5120,16384,8
++16,5120,16384,16
++16,5120,16384,32
++16,5120,16384,64
++16,5120,16384,128
++16,5120,16384,256
++16,5120,16384,512
++16,5120,16384,1024
++16,5120,16384,2048
++16,5120,16384,4096
++16,5120,16384,8192
++16,5120,16384,16384
++16,5120,16384,32768
++16,5120,16384,65536
++# Llama 4 Scout (16 experts) / Maverick (128 over 8 GPUs): down
++16,8192,5120,1
++16,8192,5120,2
++16,8192,5120,4
++16,8192,5120,8
++16,8192,5120,16
++16,8192,5120,32
++16,8192,5120,64
++16,8192,5120,128
++16,8192,5120,256
++16,8192,5120,512
++16,8192,5120,1024
++16,8192,5120,2048
++16,8192,5120,4096
++16,8192,5120,8192
++16,8192,5120,16384
++16,8192,5120,32768
++16,8192,5120,65536
++# Qwen3-235B-A22B, 128 experts on one GPU: gate+up
++128,4096,3072,1
++128,4096,3072,2
++128,4096,3072,4
++128,4096,3072,8
++128,4096,3072,16
++128,4096,3072,32
++128,4096,3072,64
++128,4096,3072,128
++128,4096,3072,256
++128,4096,3072,512
++128,4096,3072,1024
++128,4096,3072,2048
++128,4096,3072,4096
++128,4096,3072,8192
++128,4096,3072,16384
++128,4096,3072,32768
++128,4096,3072,65536
++# Qwen3-235B-A22B, 128 experts over 8 GPUs: gate+up
++16,4096,3072,1
++16,4096,3072,2
++16,4096,3072,4
++16,4096,3072,8
++16,4096,3072,16
++16,4096,3072,32
++16,4096,3072,64
++16,4096,3072,128
++16,4096,3072,256
++16,4096,3072,512
++16,4096,3072,1024
++16,4096,3072,2048
++16,4096,3072,4096
++16,4096,3072,8192
++16,4096,3072,16384
++16,4096,3072,32768
++16,4096,3072,65536
++# Qwen3-235B-A22B, 128 experts over 8 GPUs: down
++16,1536,4096,1
++16,1536,4096,2
++16,1536,4096,4
++16,1536,4096,8
++16,1536,4096,16
++16,1536,4096,32
++16,1536,4096,64
++16,1536,4096,128
++16,1536,4096,256
++16,1536,4096,512
++16,1536,4096,1024
++16,1536,4096,2048
++16,1536,4096,4096
++16,1536,4096,8192
++16,1536,4096,16384
++16,1536,4096,32768
++16,1536,4096,65536
++# Mixtral 8x7B: gate+up
++8,4096,28672,1
++8,4096,28672,2
++8,4096,28672,4
++8,4096,28672,8
++8,4096,28672,16
++8,4096,28672,32
++8,4096,28672,64
++8,4096,28672,128
++8,4096,28672,256
++8,4096,28672,512
++8,4096,28672,1024
++8,4096,28672,2048
++8,4096,28672,4096
++8,4096,28672,8192
++8,4096,28672,16384
++8,4096,28672,32768
++8,4096,28672,65536
++# Mixtral 8x7B: down
++8,14336,4096,1
++8,14336,4096,2
++8,14336,4096,4
++8,14336,4096,8
++8,14336,4096,16
++8,14336,4096,32
++8,14336,4096,64
++8,14336,4096,128
++8,14336,4096,256
++8,14336,4096,512
++8,14336,4096,1024
++8,14336,4096,2048
++8,14336,4096,4096
++8,14336,4096,8192
++8,14336,4096,16384
++8,14336,4096,32768
++8,14336,4096,65536
++# gpt-oss-120b, 128 experts over 8 GPUs: gate+up
++16,2880,5760,1
++16,2880,5760,2
++16,2880,5760,4
++16,2880,5760,8
++16,2880,5760,16
++16,2880,5760,32
++16,2880,5760,64
++16,2880,5760,128
++16,2880,5760,256
++16,2880,5760,512
++16,2880,5760,1024
++16,2880,5760,2048
++16,2880,5760,4096
++16,2880,5760,8192
++16,2880,5760,16384
++16,2880,5760,32768
++16,2880,5760,65536
+diff --git a/bench/aiter/untuned/bf16bf16bf16_grouped_stacked.csv b/bench/aiter/untuned/bf16bf16bf16_grouped_stacked.csv
+new file mode 100644
+index 0000000..2981846
+--- /dev/null
++++ b/bench/aiter/untuned/bf16bf16bf16_grouped_stacked.csv
+@@ -0,0 +1,193 @@
++# Shapes tuned for mslk::bf16bf16bf16_grouped_stacked; each row becomes one row of its tuning table.
++# G is the number of groups (experts on one GPU), [N, K] each group's weight, and M_max the bucket
++# bound on total rows (tokens x top-k) across groups (see mslk/aiter/routing.py).
++# Initial list: MoE layers of public models (aiter ships no per-shape gmm configs), to be replaced
++# by the shapes Meta's models use. M = 1, 2, 4, ..., 32768.
++G,N,K,M_max
++# DeepSeek-V3/R1, 256 experts over 8 GPUs: gate+up
++32,4096,7168,1
++32,4096,7168,2
++32,4096,7168,4
++32,4096,7168,8
++32,4096,7168,16
++32,4096,7168,32
++32,4096,7168,64
++32,4096,7168,128
++32,4096,7168,256
++32,4096,7168,512
++32,4096,7168,1024
++32,4096,7168,2048
++32,4096,7168,4096
++32,4096,7168,8192
++32,4096,7168,16384
++32,4096,7168,32768
++# DeepSeek-V3/R1, 256 experts over 8 GPUs: down
++32,7168,2048,1
++32,7168,2048,2
++32,7168,2048,4
++32,7168,2048,8
++32,7168,2048,16
++32,7168,2048,32
++32,7168,2048,64
++32,7168,2048,128
++32,7168,2048,256
++32,7168,2048,512
++32,7168,2048,1024
++32,7168,2048,2048
++32,7168,2048,4096
++32,7168,2048,8192
++32,7168,2048,16384
++32,7168,2048,32768
++# Llama 4 Scout (16 experts) / Maverick (128 over 8 GPUs): gate+up
++16,16384,5120,1
++16,16384,5120,2
++16,16384,5120,4
++16,16384,5120,8
++16,16384,5120,16
++16,16384,5120,32
++16,16384,5120,64
++16,16384,5120,128
++16,16384,5120,256
++16,16384,5120,512
++16,16384,5120,1024
++16,16384,5120,2048
++16,16384,5120,4096
++16,16384,5120,8192
++16,16384,5120,16384
++16,16384,5120,32768
++# Llama 4 Scout (16 experts) / Maverick (128 over 8 GPUs): down
++16,5120,8192,1
++16,5120,8192,2
++16,5120,8192,4
++16,5120,8192,8
++16,5120,8192,16
++16,5120,8192,32
++16,5120,8192,64
++16,5120,8192,128
++16,5120,8192,256
++16,5120,8192,512
++16,5120,8192,1024
++16,5120,8192,2048
++16,5120,8192,4096
++16,5120,8192,8192
++16,5120,8192,16384
++16,5120,8192,32768
++# Qwen3-235B-A22B, 128 experts on one GPU: gate+up
++128,3072,4096,1
++128,3072,4096,2
++128,3072,4096,4
++128,3072,4096,8
++128,3072,4096,16
++128,3072,4096,32
++128,3072,4096,64
++128,3072,4096,128
++128,3072,4096,256
++128,3072,4096,512
++128,3072,4096,1024
++128,3072,4096,2048
++128,3072,4096,4096
++128,3072,4096,8192
++128,3072,4096,16384
++128,3072,4096,32768
++# Qwen3-235B-A22B, 128 experts over 8 GPUs: gate+up
++16,3072,4096,1
++16,3072,4096,2
++16,3072,4096,4
++16,3072,4096,8
++16,3072,4096,16
++16,3072,4096,32
++16,3072,4096,64
++16,3072,4096,128
++16,3072,4096,256
++16,3072,4096,512
++16,3072,4096,1024
++16,3072,4096,2048
++16,3072,4096,4096
++16,3072,4096,8192
++16,3072,4096,16384
++16,3072,4096,32768
++# Qwen3-235B-A22B, 128 experts over 8 GPUs: down
++16,4096,1536,1
++16,4096,1536,2
++16,4096,1536,4
++16,4096,1536,8
++16,4096,1536,16
++16,4096,1536,32
++16,4096,1536,64
++16,4096,1536,128
++16,4096,1536,256
++16,4096,1536,512
++16,4096,1536,1024
++16,4096,1536,2048
++16,4096,1536,4096
++16,4096,1536,8192
++16,4096,1536,16384
++16,4096,1536,32768
++# Mixtral 8x7B: gate+up
++8,28672,4096,1
++8,28672,4096,2
++8,28672,4096,4
++8,28672,4096,8
++8,28672,4096,16
++8,28672,4096,32
++8,28672,4096,64
++8,28672,4096,128
++8,28672,4096,256
++8,28672,4096,512
++8,28672,4096,1024
++8,28672,4096,2048
++8,28672,4096,4096
++8,28672,4096,8192
++8,28672,4096,16384
++8,28672,4096,32768
++# Mixtral 8x7B: down
++8,4096,14336,1
++8,4096,14336,2
++8,4096,14336,4
++8,4096,14336,8
++8,4096,14336,16
++8,4096,14336,32
++8,4096,14336,64
++8,4096,14336,128
++8,4096,14336,256
++8,4096,14336,512
++8,4096,14336,1024
++8,4096,14336,2048
++8,4096,14336,4096
++8,4096,14336,8192
++8,4096,14336,16384
++8,4096,14336,32768
++# gpt-oss-120b, 128 experts over 8 GPUs: gate+up
++16,5760,2880,1
++16,5760,2880,2
++16,5760,2880,4
++16,5760,2880,8
++16,5760,2880,16
++16,5760,2880,32
++16,5760,2880,64
++16,5760,2880,128
++16,5760,2880,256
++16,5760,2880,512
++16,5760,2880,1024
++16,5760,2880,2048
++16,5760,2880,4096
++16,5760,2880,8192
++16,5760,2880,16384
++16,5760,2880,32768
++# gpt-oss-120b, 128 experts over 8 GPUs: down
++16,2880,2880,1
++16,2880,2880,2
++16,2880,2880,4
++16,2880,2880,8
++16,2880,2880,16
++16,2880,2880,32
++16,2880,2880,64
++16,2880,2880,128
++16,2880,2880,256
++16,2880,2880,512
++16,2880,2880,1024
++16,2880,2880,2048
++16,2880,2880,4096
++16,2880,2880,8192
++16,2880,2880,16384
++16,2880,2880,32768
+diff --git a/mslk/gemm/__init__.py b/mslk/gemm/__init__.py
+index e9f34e8..e70898e 100644
+--- a/mslk/gemm/__init__.py
++++ b/mslk/gemm/__init__.py
+@@ -226,11 +226,13 @@ if torch.version.hip is not None:
+                     f"out must hold {total_m * n} elements, got {out.numel()}"
+                 )
+                 assert out.is_contiguous(), "out must be contiguous"
+-            device_index = X.get_device()
+-            with torch.cuda.device(device_index):
+-                return _bf16bf16bf16_grouped_stacked_impl(device_index)(
+-                    X, W, M_sizes, out, num_sms
+-                )
++            # Imported on first call, like the backends it chooses between.
++            from mslk.gemm.dispatch.bf16bf16bf16_grouped_stacked import (
++                ROUTING as _grouped_stacked_routing,
++            )
++
++            with torch.cuda.device(X.get_device()):
++                return _grouped_stacked_routing(X, W, M_sizes, out, num_sms)
+ 
+         if not torch._C._dispatch_has_kernel_for_dispatch_key(
+             "mslk::bf16bf16bf16_grouped_stacked", "CUDA"
+diff --git a/mslk/gemm/aiter/bf16bf16bf16_grouped_grad.py b/mslk/gemm/aiter/bf16bf16bf16_grouped_grad.py
+new file mode 100644
+index 0000000..226fc4c
+--- /dev/null
++++ b/mslk/gemm/aiter/bf16bf16bf16_grouped_grad.py
+@@ -0,0 +1,41 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""aiter backend of ``mslk::bf16bf16bf16_grouped_grad`` (dgrad) on ROCm.
++
++aiter's Triton ``gmm`` computes ``out[g] = X[g] @ W[g].T``. ``W`` is the
++``[G, N, K]`` view ``w.permute(0, 2, 1)`` of a contiguous ``[G, K, N]`` weight,
++so ``W.permute(0, 2, 1)`` is gmm's non-transposed RHS. ``num_sms`` becomes
++``grid_dim``.
++
++Which calls this backend serves is decided in
++``mslk/gemm/dispatch/bf16bf16bf16_grouped_grad.py``.
++"""
++
++from typing import Optional
++
++import torch
++from mslk.aiter.common import import_aiter_module
++
++
++def bf16bf16bf16_grouped_grad(
++    X: torch.Tensor,
++    W: torch.Tensor,
++    M_sizes: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    num_sms: Optional[int] = None,
++) -> torch.Tensor:
++    """``mslk::bf16bf16bf16_grouped_grad`` computed by aiter's ``gmm``."""
++    gmm = import_aiter_module("aiter.ops.triton.gemm.grouped.gmm").gmm
++    total_M, N = X.shape[0], W.shape[1]
++    return gmm(
++        X,
++        W.permute(0, 2, 1),
++        M_sizes,
++        preferred_element_type=torch.bfloat16,
++        existing_out=None if out is None else out.view(total_M, N),
++        grid_dim=num_sms,
++    )
+diff --git a/mslk/gemm/aiter/bf16bf16bf16_grouped_stacked.py b/mslk/gemm/aiter/bf16bf16bf16_grouped_stacked.py
+new file mode 100644
+index 0000000..6ec7b7e
+--- /dev/null
++++ b/mslk/gemm/aiter/bf16bf16bf16_grouped_stacked.py
+@@ -0,0 +1,41 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""aiter backend of ``mslk::bf16bf16bf16_grouped_stacked`` on ROCm.
++
++aiter's Triton ``gmm`` computes ``out[g] = X[g] @ W[g].T`` with groups packed
++along M. ``W`` ([G, N, K], row-major) is passed as ``W.transpose(1, 2)``,
++gmm's transposed layout 1, which unlike layout 2 is unambiguous when K == N.
++``out`` is viewed as ``[total_M, N]`` and ``num_sms`` becomes ``grid_dim``.
++
++Which calls this backend serves is decided in
++``mslk/gemm/dispatch/bf16bf16bf16_grouped_stacked.py``.
++"""
++
++from typing import Optional
++
++import torch
++from mslk.aiter.common import import_aiter_module
++
++
++def bf16bf16bf16_grouped_stacked(
++    X: torch.Tensor,
++    W: torch.Tensor,
++    M_sizes: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    num_sms: Optional[int] = None,
++) -> torch.Tensor:
++    """``mslk::bf16bf16bf16_grouped_stacked`` computed by aiter's ``gmm``."""
++    gmm = import_aiter_module("aiter.ops.triton.gemm.grouped.gmm").gmm
++    total_M, N = X.shape[0], W.shape[1]
++    return gmm(
++        X,
++        W.transpose(1, 2),
++        M_sizes,
++        preferred_element_type=torch.bfloat16,
++        existing_out=None if out is None else out.view(total_M, N),
++        grid_dim=num_sms,
++    )
+diff --git a/mslk/gemm/dispatch/bf16bf16bf16_grouped_grad.py b/mslk/gemm/dispatch/bf16bf16bf16_grouped_grad.py
+new file mode 100644
+index 0000000..ce822f1
+--- /dev/null
++++ b/mslk/gemm/dispatch/bf16bf16bf16_grouped_grad.py
+@@ -0,0 +1,105 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Which backend serves ``mslk::bf16bf16bf16_grouped_grad`` (dgrad) on ROCm.
++
++- ``mslk``: MSLK's Triton kernel (``grouped_gemm_dgrad`` in
++  ``mslk/gemm/triton/grouped_gemm.py``), the default and the fallback.
++- ``aiter``: aiter's Triton ``gmm``
++  (``mslk/gemm/aiter/bf16bf16bf16_grouped_grad.py``), for the shapes
++  ``tables/bf16bf16bf16_grouped_grad.csv`` assigns to it. That table is written
++  by ``bench/aiter/tune_bf16bf16bf16_grouped_grad.py``.
++
++aiter does not take calls with K == N (its weight layouts are ambiguous there)
++or with other than the expected strides; those go to MSLK's kernel.
++"""
++
++from typing import Optional, Sequence, Tuple
++
++import torch
++from mslk.aiter.routing import MSLK, OpRouting
++
++OP: str = "bf16bf16bf16_grouped_grad"
++AITER: str = "aiter"
++
++
++# Backends are imported on first use: importing mslk.gemm must not pull in
++# Triton on CPU-only nodes, nor aiter anywhere.
++def _mslk(
++    X: torch.Tensor,
++    W: torch.Tensor,
++    M_sizes: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    num_sms: Optional[int] = None,
++) -> torch.Tensor:
++    from mslk.gemm.triton.grouped_gemm import grouped_gemm_dgrad
++
++    return grouped_gemm_dgrad(X, W, M_sizes, out=out, num_sms=num_sms)
++
++
++def _aiter(
++    X: torch.Tensor,
++    W: torch.Tensor,
++    M_sizes: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    num_sms: Optional[int] = None,
++) -> torch.Tensor:
++    from mslk.gemm.aiter import bf16bf16bf16_grouped_grad as aiter_grad
++
++    return aiter_grad.bf16bf16bf16_grouped_grad(X, W, M_sizes, out, num_sms)
++
++
++def _aiter_accepts(
++    X: torch.Tensor,
++    W: torch.Tensor,
++    M_sizes: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    num_sms: Optional[int] = None,
++) -> bool:
++    if X.dim() != 2 or W.dim() != 3 or M_sizes.dim() != 1:
++        return False
++    total_M, K = X.shape
++    G, N, K_w = W.shape
++    # aiter compares strides exactly; is_contiguous() ignores size-1 dims.
++    return (
++        total_M > 0
++        and K == K_w
++        and K != N
++        and X.dtype == W.dtype == torch.bfloat16
++        and M_sizes.shape == (G,)
++        and M_sizes.dtype == torch.int64
++        and M_sizes.is_contiguous()
++        and X.stride() == (K, 1)
++        and W.stride() == (K * N, 1, N)
++        and (
++            out is None
++            or (
++                out.dtype == torch.bfloat16
++                and out.is_contiguous()
++                and out.numel() == total_M * N
++            )
++        )
++    )
++
++
++def _key(
++    X: torch.Tensor, W: torch.Tensor, *args: object, **kwargs: object
++) -> Tuple[Sequence[object], int]:
++    return tuple(W.shape), X.shape[0]
++
++
++#: ``mslk::bf16bf16bf16_grouped_grad`` on ROCm: call it with the op's arguments.
++ROUTING: OpRouting = OpRouting(
++    OP,
++    "mslk.gemm.dispatch",
++    "tables/bf16bf16bf16_grouped_grad.csv",
++    key_columns=("G", "N", "K"),
++    bucket_column="M_max",
++    backends={MSLK: _mslk, AITER: _aiter},
++    key=_key,
++    accepts={AITER: _aiter_accepts},
++)
++BACKENDS: Tuple[str, ...] = tuple(ROUTING.backends)
+diff --git a/mslk/gemm/dispatch/bf16bf16bf16_grouped_stacked.py b/mslk/gemm/dispatch/bf16bf16bf16_grouped_stacked.py
+new file mode 100644
+index 0000000..f39c107
+--- /dev/null
++++ b/mslk/gemm/dispatch/bf16bf16bf16_grouped_stacked.py
+@@ -0,0 +1,85 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Which backend serves ``mslk::bf16bf16bf16_grouped_stacked`` on ROCm.
++
++- ``mslk``: MSLK's FlyDSL grouped kernel (``mslk/gemm/flydsl/bf16_grouped_gemm.py``),
++  or CK where FlyDSL cannot serve the op; the default and the fallback.
++- ``aiter``: aiter's Triton ``gmm``
++  (``mslk/gemm/aiter/bf16bf16bf16_grouped_stacked.py``), for the shapes
++  ``tables/bf16bf16bf16_grouped_stacked.csv`` assigns to it. That table is
++  written by ``bench/aiter/tune_bf16bf16bf16_grouped_stacked.py``.
++"""
++
++from typing import Optional, Sequence, Tuple
++
++import torch
++from mslk.aiter.routing import MSLK, OpRouting
++
++OP: str = "bf16bf16bf16_grouped_stacked"
++AITER: str = "aiter"
++
++
++# Backends are imported on first use: importing mslk.gemm must not pull in
++# FlyDSL or Triton on CPU-only nodes, nor aiter anywhere.
++def _mslk(
++    X: torch.Tensor,
++    W: torch.Tensor,
++    M_sizes: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    num_sms: Optional[int] = None,
++) -> torch.Tensor:
++    from mslk import gemm
++
++    return gemm._bf16bf16bf16_grouped_stacked_impl(X.get_device())(
++        X, W, M_sizes, out, num_sms
++    )
++
++
++def _aiter(
++    X: torch.Tensor,
++    W: torch.Tensor,
++    M_sizes: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    num_sms: Optional[int] = None,
++) -> torch.Tensor:
++    from mslk.gemm.aiter import bf16bf16bf16_grouped_stacked as aiter_stacked
++
++    return aiter_stacked.bf16bf16bf16_grouped_stacked(X, W, M_sizes, out, num_sms)
++
++
++def _aiter_accepts(
++    X: torch.Tensor,
++    W: torch.Tensor,
++    M_sizes: torch.Tensor,
++    out: Optional[torch.Tensor] = None,
++    num_sms: Optional[int] = None,
++) -> bool:
++    # The op's registration has checked dtypes and shapes. aiter compares
++    # strides exactly; is_contiguous() ignores size-1 dims.
++    total_M, K = X.shape
++    G, N, _ = W.shape
++    return total_M > 0 and X.stride() == (K, 1) and W.stride() == (N * K, K, 1)
++
++
++def _key(
++    X: torch.Tensor, W: torch.Tensor, *args: object, **kwargs: object
++) -> Tuple[Sequence[object], int]:
++    return tuple(W.shape), X.shape[0]
++
++
++#: ``mslk::bf16bf16bf16_grouped_stacked`` on ROCm: call it with the op's arguments.
++ROUTING: OpRouting = OpRouting(
++    OP,
++    "mslk.gemm.dispatch",
++    "tables/bf16bf16bf16_grouped_stacked.csv",
++    key_columns=("G", "N", "K"),
++    bucket_column="M_max",
++    backends={MSLK: _mslk, AITER: _aiter},
++    key=_key,
++    accepts={AITER: _aiter_accepts},
++)
++BACKENDS: Tuple[str, ...] = tuple(ROUTING.backends)
+diff --git a/mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_grad.csv b/mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_grad.csv
+new file mode 100644
+index 0000000..029be24
+--- /dev/null
++++ b/mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_grad.csv
+@@ -0,0 +1,171 @@
++gfx,cu_num,G,N,K,M_max,backend,us,err_ratio,max_abs_err,tflops,bw,mslk_us,aiter_us
++gfx950,256,8,4096,28672,1,mslk,116.69,0,1.977,2.01,16103.20,116.69,890.39
++gfx950,256,8,4096,28672,2,mslk,183.96,0,1.963,2.55,10215.32,183.96,1056.09
++gfx950,256,8,4096,28672,4,mslk,212.51,0,1.906,4.42,8843.54,212.51,1062.57
++gfx950,256,8,4096,28672,8,mslk,195.72,0,1.949,9.60,9603.42,195.72,1052.78
++gfx950,256,8,4096,28672,16,mslk,320.73,0,1.996,11.72,5862.01,320.73,1063.70
++gfx950,256,8,4096,28672,32,mslk,311.21,0,1.998,24.15,6044.60,311.21,1062.00
++gfx950,256,8,4096,28672,64,mslk,217.35,0,1.999,69.16,8664.43,217.35,1055.67
++gfx950,256,8,4096,28672,128,mslk,412.33,0,1.998,72.91,4577.46,412.33,1074.81
++gfx950,256,8,4096,28672,256,mslk,371.86,0,1.999,161.70,5098.27,371.86,1061.06
++gfx950,256,8,4096,28672,512,mslk,475.86,0,2,252.72,4019.26,475.86,1066.95
++gfx950,256,8,4096,28672,1024,mslk,680.63,0,2,353.37,2859.33,680.63,1077.66
++gfx950,256,8,4096,28672,2048,aiter,1055.41,0,2,455.78,1907.57,1232.68,1055.41
++gfx950,256,8,4096,28672,4096,mslk,1826.18,0,2.001,526.82,1175.94,1826.18,1845.12
++gfx950,256,8,4096,28672,8192,aiter,2999.77,0,2.003,641.43,805.37,3226.26,2999.77
++gfx950,256,8,4096,28672,16384,aiter,5189.07,0,2.003,741.61,569.04,5936.55,5189.07
++gfx950,256,8,4096,28672,32768,aiter,9508.29,0,2.004,809.46,423.48,12016.76,9508.29
++gfx950,256,8,4096,28672,65536,aiter,18157.66,0,2.004,847.75,340.02,25450.78,18157.66
++gfx950,256,8,14336,4096,1,mslk,29.35,0,0.9762,4.00,32008.06,29.35,151.06
++gfx950,256,8,14336,4096,2,mslk,42.80,0,0.5994,5.49,21951.97,42.80,162.07
++gfx950,256,8,14336,4096,4,mslk,83.77,0,0.6969,5.61,11217.92,83.77,186.51
++gfx950,256,8,14336,4096,8,mslk,93.98,0,0.9326,10.00,9999.80,93.98,212.25
++gfx950,256,8,14336,4096,16,mslk,91.82,0,0.9767,20.46,10238.60,91.82,195.09
++gfx950,256,8,14336,4096,32,mslk,170.94,0,0.9702,21.98,5503.14,170.94,385.88
++gfx950,256,8,14336,4096,64,mslk,96.58,0,1,77.82,9752.39,96.58,221.59
++gfx950,256,8,14336,4096,128,mslk,108.91,0,0.9961,138.02,8669.78,108.91,226.36
++gfx950,256,8,14336,4096,256,mslk,204.17,0,0.9957,147.25,4647.91,204.17,400.07
++gfx950,256,8,14336,4096,512,mslk,240.61,0,0.9999,249.90,3983.13,240.61,415.50
++gfx950,256,8,14336,4096,1024,mslk,350.69,0,0.9997,342.92,2786.71,350.69,578.71
++gfx950,256,8,14336,4096,2048,mslk,540.93,0,0.9995,444.64,1876.42,540.93,623.17
++gfx950,256,8,14336,4096,4096,aiter,795.39,0,1,604.78,1371.05,841.58,795.39
++gfx950,256,8,14336,4096,8192,aiter,1291.53,0,1,744.91,961.27,1517.03,1291.53
++gfx950,256,8,14336,4096,16384,aiter,2369.63,0,1,812.00,651.37,2817.62,2369.63
++gfx950,256,8,14336,4096,32768,aiter,4662.96,0,1,825.29,460.54,5372.49,4662.96
++gfx950,256,8,14336,4096,65536,aiter,9061.32,0,1,849.39,370.30,10605.66,9061.32
++gfx950,256,16,1536,4096,1,mslk,22.60,0,0.4957,0.56,8910.30,22.60,152.50
++gfx950,256,16,1536,4096,2,mslk,24.15,0,0.4998,1.04,8337.96,24.15,154.03
++gfx950,256,16,1536,4096,4,mslk,23.23,0,0.4992,2.17,8668.42,23.23,154.20
++gfx950,256,16,1536,4096,8,mslk,30.99,0,0.5382,3.25,6500.07,30.99,178.36
++gfx950,256,16,1536,4096,16,mslk,33.96,0,0.4998,5.93,5933.59,33.96,180.61
++gfx950,256,16,1536,4096,32,mslk,35.16,0,0.4999,11.45,5736.64,35.16,182.05
++gfx950,256,16,1536,4096,64,mslk,36.70,0,0.9395,21.94,5505.35,36.70,181.27
++gfx950,256,16,1536,4096,128,mslk,53.61,0,0.9478,30.04,3782.29,53.61,182.96
++gfx950,256,16,1536,4096,256,mslk,57.04,0,0.9782,56.47,3579.89,57.04,184.49
++gfx950,256,16,1536,4096,512,mslk,63.77,0,0.9967,101.02,3247.28,63.77,185.19
++gfx950,256,16,1536,4096,1024,mslk,74.88,0,0.9864,172.08,2842.84,74.88,185.45
++gfx950,256,16,1536,4096,2048,mslk,100.79,0,0.9982,255.68,2226.37,100.79,188.21
++gfx950,256,16,1536,4096,4096,mslk,173.82,0,0.999,296.52,1423.70,173.82,193.22
++gfx950,256,16,1536,4096,8192,mslk,210.66,0,0.9965,489.32,1393.72,210.66,233.11
++gfx950,256,16,1536,4096,16384,mslk,374.06,0,0.9999,551.14,1031.58,374.06,402.14
++gfx950,256,16,1536,4096,32768,mslk,652.59,0,1,631.81,874.09,652.59,724.16
++gfx950,256,16,1536,4096,65536,mslk,1202.73,0,0.9998,685.64,781.16,1202.73,1283.98
++gfx950,256,16,2880,5760,1,mslk,27.59,0,0.5743,1.20,19239.67,27.59,204.97
++gfx950,256,16,2880,5760,2,mslk,28.32,0,0.76,2.34,18748.48,28.32,205.75
++gfx950,256,16,2880,5760,4,mslk,28.65,0,0.8611,4.63,18529.43,28.65,207.63
++gfx950,256,16,2880,5760,8,mslk,34.15,0,0.933,7.77,15550.21,34.15,230.86
++gfx950,256,16,2880,5760,16,mslk,71.69,0,0.9811,7.41,7408.87,71.69,245.52
++gfx950,256,16,2880,5760,32,mslk,71.90,0,0.9961,14.77,7390.67,71.90,245.05
++gfx950,256,16,2880,5760,64,mslk,105.31,0,0.9954,20.16,5051.02,105.31,249.44
++gfx950,256,16,2880,5760,128,mslk,107.23,0,0.9985,39.61,4971.27,107.23,250.32
++gfx950,256,16,2880,5760,256,mslk,112.76,0,0.9991,75.32,4746.89,112.76,253.48
++gfx950,256,16,2880,5760,512,mslk,134.08,0,0.9996,126.69,4025.17,134.08,267.84
++gfx950,256,16,2880,5760,1024,mslk,163.07,0,1,208.34,3363.78,163.07,290.98
++gfx950,256,16,2880,5760,2048,mslk,252.11,0,1,269.52,2246.01,252.11,300.74
++gfx950,256,16,2880,5760,4096,mslk,358.53,0,0.9998,379.04,1678.03,358.53,486.58
++gfx950,256,16,2880,5760,8192,mslk,531.67,0,1,511.21,1264.70,531.67,571.21
++gfx950,256,16,2880,5760,16384,mslk,913.91,0,1,594.79,890.64,913.91,1026.01
++gfx950,256,16,2880,5760,32768,mslk,1690.01,0,1,643.29,649.15,1690.01,1788.07
++gfx950,256,16,2880,5760,65536,mslk,3264.46,0,1,666.06,509.52,3264.46,3257.81
++gfx950,256,16,4096,3072,1,mslk,18.24,0,0.4987,1.38,22074.89,18.24,124.54
++gfx950,256,16,4096,3072,2,mslk,18.94,0,0.4986,2.66,21260.72,18.94,126.07
++gfx950,256,16,4096,3072,4,mslk,21.59,0,0.4996,4.66,18649.36,21.59,126.32
++gfx950,256,16,4096,3072,8,mslk,20.20,0,0.4988,9.97,19943.55,20.20,127.13
++gfx950,256,16,4096,3072,16,mslk,56.85,0,0.9453,7.08,7086.92,56.85,150.91
++gfx950,256,16,4096,3072,32,mslk,52.08,0,0.5,15.46,7740.44,52.08,149.78
++gfx950,256,16,4096,3072,64,mslk,66.18,0,0.939,24.34,6098.50,66.18,163.25
++gfx950,256,16,4096,3072,128,mslk,65.67,0,0.4999,49.05,6159.42,65.67,161.60
++gfx950,256,16,4096,3072,256,mslk,72.61,0,0.6313,88.73,5596.04,72.61,160.81
++gfx950,256,16,4096,3072,512,mslk,75.86,0,0.9562,169.85,5404.59,75.86,152.78
++gfx950,256,16,4096,3072,1024,mslk,134.62,0,0.9966,191.43,3100.17,134.62,186.48
++gfx950,256,16,4096,3072,2048,mslk,165.32,0,0.9921,311.76,2613.25,165.32,273.14
++gfx950,256,16,4096,3072,4096,mslk,243.48,0,0.98,423.35,1894.88,243.48,318.35
++gfx950,256,16,4096,3072,8192,mslk,383.87,0,0.9969,537.06,1354.88,383.87,457.27
++gfx950,256,16,4096,3072,16384,mslk,673.12,0,0.9962,612.54,947.13,673.12,739.59
++gfx950,256,16,4096,3072,32768,mslk,1255.42,0,0.9996,656.86,694.92,1255.42,1304.81
++gfx950,256,16,4096,3072,65536,mslk,2381.12,0,0.9995,692.64,563.68,2381.12,2421.66
++gfx950,256,16,5120,16384,1,mslk,101.10,0,0.996,1.66,26552.51,101.10,544.85
++gfx950,256,16,5120,16384,2,mslk,100.71,0,1.726,3.33,26654.92,100.71,544.26
++gfx950,256,16,5120,16384,4,mslk,208.40,0,0.9998,3.22,12881.57,208.40,672.31
++gfx950,256,16,5120,16384,8,mslk,198.68,0,1.858,6.76,13512.88,198.68,664.48
++gfx950,256,16,5120,16384,16,mslk,319.27,0,1.908,8.41,8409.99,319.27,681.04
++gfx950,256,16,5120,16384,32,mslk,363.08,0,1.937,14.79,7396.99,363.08,788.98
++gfx950,256,16,5120,16384,64,mslk,348.17,0,1.796,30.84,7717.89,348.17,761.85
++gfx950,256,16,5120,16384,128,mslk,595.73,0,1.987,36.05,4515.22,595.73,1335.62
++gfx950,256,16,5120,16384,256,mslk,413.58,0,1.992,103.85,6517.20,413.58,831.39
++gfx950,256,16,5120,16384,512,mslk,666.96,0,1.994,128.79,4057.75,666.96,1350.56
++gfx950,256,16,5120,16384,1024,mslk,766.57,0,1.994,224.11,3559.21,766.57,1370.61
++gfx950,256,16,5120,16384,2048,mslk,1212.20,0,2,283.45,2287.11,1212.20,1429.02
++gfx950,256,16,5120,16384,4096,mslk,1776.54,0,1.999,386.82,1610.17,1776.54,1742.59
++gfx950,256,16,5120,16384,8192,aiter,2459.22,0,1.996,558.87,1234.81,2770.66,2459.22
++gfx950,256,16,5120,16384,16384,aiter,3786.27,0,2.002,725.99,895.08,4909.22,3786.27
++gfx950,256,16,5120,16384,32768,aiter,6818.72,0,2,806.24,600.35,9199.18,6818.72
++gfx950,256,16,5120,16384,65536,aiter,13439.60,0,2.002,818.11,409.46,18110.86,13439.60
++gfx950,256,16,8192,5120,1,mslk,28.79,0,0.5895,2.91,46619.42,28.79,190.76
++gfx950,256,16,8192,5120,2,mslk,31.31,0,0.6979,5.36,42873.60,31.31,192.12
++gfx950,256,16,8192,5120,4,mslk,46.51,0,0.9855,7.21,28859.85,46.51,205.42
++gfx950,256,16,8192,5120,8,mslk,104.07,0,0.902,6.45,12899.30,104.07,241.68
++gfx950,256,16,8192,5120,16,mslk,113.78,0,0.9985,11.80,11799.60,113.78,265.81
++gfx950,256,16,8192,5120,32,mslk,191.66,0,0.9775,14.01,7007.19,191.66,430.69
++gfx950,256,16,8192,5120,64,mslk,215.19,0,0.9908,24.95,6244.96,215.19,476.51
++gfx950,256,16,8192,5120,128,mslk,214.70,0,0.9983,50.01,6267.33,214.70,501.58
++gfx950,256,16,8192,5120,256,mslk,215.64,0,0.9993,99.59,6255.71,215.64,506.91
++gfx950,256,16,8192,5120,512,mslk,300.77,0,0.9996,142.80,4507.85,300.77,528.98
++gfx950,256,16,8192,5120,1024,mslk,349.15,0,1,246.02,3922.20,349.15,512.96
++gfx950,256,16,8192,5120,2048,mslk,453.71,0,1,378.65,3078.41,453.71,711.84
++gfx950,256,16,8192,5120,4096,mslk,765.72,0,1,448.73,1895.25,765.72,798.43
++gfx950,256,16,8192,5120,8192,mslk,1175.61,0,1,584.55,1327.21,1175.61,1169.64
++gfx950,256,16,8192,5120,16384,aiter,1927.57,0,1,713.02,922.61,2163.48,1927.57
++gfx950,256,16,8192,5120,32768,aiter,3465.30,0,1.001,793.23,639.08,4031.33,3465.30
++gfx950,256,16,8192,5120,65536,aiter,6531.83,0,1.001,841.66,472.61,7761.89,6531.83
++gfx950,256,32,2048,7168,1,mslk,33.16,0,0.6893,0.89,28337.47,33.16,263.08
++gfx950,256,32,2048,7168,2,mslk,37.90,0,0.675,1.55,24791.10,37.90,265.34
++gfx950,256,32,2048,7168,4,mslk,38.77,0,0.9789,3.03,24237.48,38.77,266.64
++gfx950,256,32,2048,7168,8,mslk,39.83,0,0.9929,5.90,23592.33,39.83,266.73
++gfx950,256,32,2048,7168,16,mslk,90.69,0,0.999,5.18,10363.13,90.69,308.26
++gfx950,256,32,2048,7168,32,mslk,116.34,0,0.9901,8.08,8081.07,116.34,315.04
++gfx950,256,32,2048,7168,64,mslk,135.28,0,0.9966,13.89,6953.94,135.28,311.83
++gfx950,256,32,2048,7168,128,mslk,150.81,0,0.9982,24.92,6245.66,150.81,349.51
++gfx950,256,32,2048,7168,256,mslk,164.66,0,1,45.65,5734.60,164.66,337.86
++gfx950,256,32,2048,7168,512,mslk,167.82,0,0.9995,89.58,5654.80,167.82,350.76
++gfx950,256,32,2048,7168,1024,mslk,202.32,0,1,148.60,4737.05,202.32,372.85
++gfx950,256,32,2048,7168,2048,mslk,305.19,0,1,197.02,3202.16,305.19,397.64
++gfx950,256,32,2048,7168,4096,mslk,369.93,0,1,325.08,2743.78,369.93,595.26
++gfx950,256,32,2048,7168,8192,mslk,547.15,0,1,439.59,1993.10,547.15,690.75
++gfx950,256,32,2048,7168,16384,mslk,902.68,0,1,532.90,1375.37,902.68,1008.32
++gfx950,256,32,2048,7168,32768,mslk,1557.44,0,1.001,617.73,991.05,1557.44,1651.03
++gfx950,256,32,2048,7168,65536,mslk,2865.05,0,1.001,671.59,749.54,2865.05,2890.80
++gfx950,256,32,7168,4096,1,mslk,29.53,0,0.4986,1.99,63641.57,29.53,177.27
++gfx950,256,32,7168,4096,2,mslk,31.52,0,0.9478,3.73,59619.20,31.52,177.88
++gfx950,256,32,7168,4096,4,mslk,44.77,0,0.9745,5.25,41976.94,44.77,186.96
++gfx950,256,32,7168,4096,8,mslk,92.12,0,0.8988,5.10,20398.73,92.12,225.25
++gfx950,256,32,7168,4096,16,mslk,165.03,0,0.8548,5.69,11388.33,165.03,383.34
++gfx950,256,32,7168,4096,32,mslk,188.80,0,0.9829,9.95,9956.26,188.80,434.71
++gfx950,256,32,7168,4096,64,mslk,183.44,0,0.9735,20.49,10251.48,183.44,421.02
++gfx950,256,32,7168,4096,128,mslk,257.07,0,0.9942,29.24,7320.67,257.07,572.02
++gfx950,256,32,7168,4096,256,mslk,271.31,0,0.998,55.41,6947.01,271.31,615.31
++gfx950,256,32,7168,4096,512,mslk,353.48,0,0.9921,85.05,5348.44,353.48,767.98
++gfx950,256,32,7168,4096,1024,mslk,403.57,0,0.9987,148.99,4713.19,403.57,797.40
++gfx950,256,32,7168,4096,2048,mslk,477.59,0,0.9996,251.80,4031.04,477.59,821.58
++gfx950,256,32,7168,4096,4096,mslk,646.13,0,0.9998,372.25,3050.99,646.13,871.30
++gfx950,256,32,7168,4096,8192,mslk,1072.39,0,0.9998,448.57,1924.30,1072.39,1072.34
++gfx950,256,32,7168,4096,16384,aiter,1657.85,0,1,580.31,1356.06,1786.77,1657.85
++gfx950,256,32,7168,4096,32768,aiter,2686.23,0,1,716.30,974.32,3024.60,2686.23
++gfx950,256,32,7168,4096,65536,aiter,4738.06,0,1,812.21,708.19,5575.98,4738.06
++gfx950,256,128,4096,3072,1,mslk,34.18,0,0.4975,0.74,94255.77,34.18,298.33
++gfx950,256,128,4096,3072,2,mslk,37.60,0,0.5,1.34,85666.32,37.60,301.25
++gfx950,256,128,4096,3072,4,mslk,38.07,0,0.4992,2.64,84618.38,38.07,301.61
++gfx950,256,128,4096,3072,8,mslk,52.47,0,0.499,3.84,61397.11,52.47,310.38
++gfx950,256,128,4096,3072,16,mslk,84.31,0,0.4998,4.78,38208.38,84.31,326.33
++gfx950,256,128,4096,3072,32,mslk,140.52,0,0.5123,5.73,22926.85,140.52,461.74
++gfx950,256,128,4096,3072,64,mslk,215.74,0,0.9608,7.47,14935.42,215.74,615.34
++gfx950,256,128,4096,3072,128,mslk,270.22,0,0.804,11.92,11927.73,270.22,751.29
++gfx950,256,128,4096,3072,256,mslk,340.27,0,0.7622,18.93,9477.36,340.27,922.80
++gfx950,256,128,4096,3072,512,mslk,356.18,0,0.9689,36.18,9064.40,356.18,991.09
++gfx950,256,128,4096,3072,1024,mslk,443.17,0,0.9619,58.15,7301.66,443.17,1196.17
++gfx950,256,128,4096,3072,2048,mslk,523.22,0,0.963,98.50,6212.63,523.22,1288.91
++gfx950,256,128,4096,3072,4096,mslk,671.64,0,0.9996,153.47,4883.48,671.64,1431.58
++gfx950,256,128,4096,3072,8192,mslk,879.03,0,0.9998,234.53,3798.14,879.03,1504.20
++gfx950,256,128,4096,3072,16384,mslk,1317.06,0,0.9929,313.06,2624.12,1317.06,1866.96
++gfx950,256,128,4096,3072,32768,mslk,1940.30,0,0.9996,425.00,1902.28,1940.30,2331.92
++gfx950,256,128,4096,3072,65536,mslk,3340.98,0,0.9994,493.65,1245.37,3340.98,3654.14
+diff --git a/mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_stacked.csv b/mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_stacked.csv
+new file mode 100644
+index 0000000..4b9847f
+--- /dev/null
++++ b/mslk/gemm/dispatch/tables/bf16bf16bf16_grouped_stacked.csv
+@@ -0,0 +1,177 @@
++gfx,cu_num,G,N,K,M_max,backend,us,err_ratio,max_abs_err,tflops,bw,mslk_us,aiter_us
++gfx950,256,8,4096,14336,1,mslk,214.27,0,0.9896,0.55,4384.87,214.27,437.59
++gfx950,256,8,4096,14336,2,mslk,215.22,0,0.9951,1.09,4365.80,215.22,440.42
++gfx950,256,8,4096,14336,4,mslk,238.20,0,0.9966,1.97,3944.88,238.20,512.68
++gfx950,256,8,4096,14336,8,mslk,240.33,0,1.255,3.91,3910.60,240.33,514.91
++gfx950,256,8,4096,14336,16,mslk,249.67,0,0.9992,7.53,3765.40,249.67,519.85
++gfx950,256,8,4096,14336,32,mslk,242.77,0,1.527,15.48,3874.87,242.77,519.76
++gfx950,256,8,4096,14336,64,mslk,244.97,0,1.915,30.68,3844.96,244.97,523.07
++gfx950,256,8,4096,14336,128,mslk,304.37,0,1.995,49.39,3102.26,304.37,545.57
++gfx950,256,8,4096,14336,256,mslk,274.80,0,1.98,109.41,3453.29,274.80,548.78
++gfx950,256,8,4096,14336,512,mslk,293.62,0,1.983,204.78,3264.03,293.62,559.97
++gfx950,256,8,4096,14336,1024,mslk,401.98,0,1.977,299.16,2431.13,401.98,571.19
++gfx950,256,8,4096,14336,2048,mslk,531.13,0,1.997,452.84,1911.04,531.13,521.68
++gfx950,256,8,4096,14336,4096,mslk,884.38,0,1.999,543.93,1233.10,884.38,948.71
++gfx950,256,8,4096,14336,8192,aiter,1469.50,0,1.998,654.69,844.85,1525.83,1469.50
++gfx950,256,8,4096,14336,16384,aiter,2552.61,0,1.999,753.80,604.68,2745.38,2552.61
++gfx950,256,8,4096,14336,32768,aiter,4733.14,0,2.001,813.05,453.71,5249.38,4733.14
++gfx950,256,8,28672,4096,1,mslk,68.43,0,0.5658,3.43,27460.37,68.43,142.74
++gfx950,256,8,28672,4096,2,mslk,130.00,0,0.6674,3.61,14455.45,130.00,189.67
++gfx950,256,8,28672,4096,4,mslk,128.75,0,0.942,7.30,14596.04,128.75,187.24
++gfx950,256,8,28672,4096,8,mslk,234.59,0,0.9294,8.01,8012.12,234.59,368.96
++gfx950,256,8,28672,4096,16,mslk,381.40,0,0.9949,9.85,4929.42,381.40,674.45
++gfx950,256,8,28672,4096,32,mslk,159.10,0,0.9879,47.24,11823.82,159.10,349.75
++gfx950,256,8,28672,4096,64,mslk,328.14,0,0.9985,45.81,5739.20,328.14,571.32
++gfx950,256,8,28672,4096,128,mslk,287.88,0,0.997,104.44,6556.33,287.88,518.94
++gfx950,256,8,28672,4096,256,mslk,300.90,0,0.9935,199.83,6300.51,300.90,547.73
++gfx950,256,8,28672,4096,512,mslk,453.57,0,0.9983,265.14,4216.79,453.57,714.04
++gfx950,256,8,28672,4096,1024,mslk,714.28,0,0.9995,336.73,2724.62,714.28,822.47
++gfx950,256,8,28672,4096,2048,aiter,989.08,0,0.9998,486.35,2035.49,1069.78,989.08
++gfx950,256,8,28672,4096,4096,aiter,1465.46,0,0.9999,656.50,1465.40,1847.49,1465.46
++gfx950,256,8,28672,4096,8192,aiter,2692.48,0,1,714.64,897.28,3350.31,2692.48
++gfx950,256,8,28672,4096,16384,aiter,4868.82,0,1,790.39,606.47,6212.77,4868.82
++gfx950,256,8,28672,4096,32768,aiter,9167.26,0,1,839.57,439.23,11935.39,9167.26
++gfx950,256,16,2880,2880,1,mslk,44.34,0,0.4995,0.37,5986.80,44.34,98.76
++gfx950,256,16,2880,2880,2,mslk,44.54,0,0.4989,0.74,5959.48,44.54,99.25
++gfx950,256,16,2880,2880,4,mslk,44.74,0,0.4995,1.48,5933.95,44.74,100.35
++gfx950,256,16,2880,2880,8,mslk,44.78,0,0.4993,2.96,5929.63,44.78,102.53
++gfx950,256,16,2880,2880,16,mslk,48.52,0,0.5,5.47,5473.86,48.52,116.18
++gfx950,256,16,2880,2880,32,mslk,50.31,0,0.4998,10.55,5283.05,50.31,117.56
++gfx950,256,16,2880,2880,64,mslk,59.14,0,0.6888,17.95,4500.35,59.14,118.82
++gfx950,256,16,2880,2880,128,mslk,70.54,0,0.9801,30.10,3783.72,70.54,125.15
++gfx950,256,16,2880,2880,256,mslk,76.62,0,0.8646,55.43,3502.75,76.62,123.86
++gfx950,256,16,2880,2880,512,mslk,77.02,0,0.7488,110.28,3522.75,77.02,131.26
++gfx950,256,16,2880,2880,1024,mslk,93.34,0,0.8773,182.00,2970.11,93.34,138.43
++gfx950,256,16,2880,2880,2048,mslk,115.98,0,0.9417,292.92,2491.89,115.98,155.24
++gfx950,256,16,2880,2880,4096,mslk,168.91,0,0.9943,402.26,1850.69,168.91,233.49
++gfx950,256,16,2880,2880,8192,mslk,290.34,0,0.9942,468.05,1239.20,290.34,352.56
++gfx950,256,16,2880,2880,16384,mslk,499.40,0,0.9986,544.23,909.42,499.40,514.36
++gfx950,256,16,2880,2880,32768,mslk,894.62,0,0.9977,607.61,718.64,894.62,916.59
++gfx950,256,16,3072,4096,1,mslk,65.02,0,0.5303,0.39,6193.42,65.02,135.62
++gfx950,256,16,3072,4096,2,mslk,65.15,0,0.4998,0.77,6180.64,65.15,137.40
++gfx950,256,16,3072,4096,4,mslk,65.30,0,0.4987,1.54,6167.03,65.30,137.53
++gfx950,256,16,3072,4096,8,mslk,72.57,0,0.752,2.77,5549.96,72.57,154.47
++gfx950,256,16,3072,4096,16,mslk,80.05,0,0.4999,5.03,5032.75,80.05,157.12
++gfx950,256,16,3072,4096,32,mslk,75.64,0,0.8915,10.65,5329.21,75.64,155.97
++gfx950,256,16,3072,4096,64,mslk,84.30,0,0.9532,19.11,4787.50,84.30,160.15
++gfx950,256,16,3072,4096,128,mslk,105.35,0,0.9518,30.58,3839.43,105.35,166.69
++gfx950,256,16,3072,4096,256,mslk,90.29,0,0.99,71.35,4500.24,90.29,166.89
++gfx950,256,16,3072,4096,512,mslk,117.45,0,0.9953,109.70,3490.72,117.45,185.14
++gfx950,256,16,3072,4096,1024,mslk,127.99,0,0.9911,201.34,3260.57,127.99,188.01
++gfx950,256,16,3072,4096,2048,mslk,166.50,0,0.999,309.55,2594.74,166.50,216.14
++gfx950,256,16,3072,4096,4096,mslk,224.19,0,0.9997,459.79,2057.98,224.19,332.89
++gfx950,256,16,3072,4096,8192,mslk,385.28,0,1,535.08,1349.90,385.28,484.90
++gfx950,256,16,3072,4096,16384,mslk,647.41,0,1,636.87,984.75,647.41,739.05
++gfx950,256,16,3072,4096,32768,mslk,1242.82,0,0.9998,663.52,701.96,1242.82,1304.72
++gfx950,256,16,4096,1536,1,mslk,27.24,0,0.4495,0.46,7390.41,27.24,59.36
++gfx950,256,16,4096,1536,2,mslk,27.50,0,0.4921,0.92,7320.92,27.50,59.92
++gfx950,256,16,4096,1536,4,mslk,27.66,0,0.4838,1.82,7279.14,27.66,60.36
++gfx950,256,16,4096,1536,8,mslk,27.84,0,0.4878,3.62,7234.29,27.84,60.60
++gfx950,256,16,4096,1536,16,mslk,32.48,0,0.4997,6.20,6204.38,32.48,70.45
++gfx950,256,16,4096,1536,32,mslk,38.06,0,0.4985,10.58,5298.68,38.06,72.81
++gfx950,256,16,4096,1536,64,mslk,42.59,0,0.4995,18.91,4743.70,42.59,73.58
++gfx950,256,16,4096,1536,128,mslk,39.17,0,0.4994,41.12,5176.46,39.17,72.31
++gfx950,256,16,4096,1536,256,mslk,53.06,0,0.4998,60.71,3848.62,53.06,84.53
++gfx950,256,16,4096,1536,512,mslk,49.81,0,0.4995,129.35,4157.87,49.81,83.78
++gfx950,256,16,4096,1536,1024,mslk,58.68,0,0.5,219.60,3627.78,58.68,87.40
++gfx950,256,16,4096,1536,2048,mslk,88.88,0,0.5,289.95,2524.78,88.88,141.38
++gfx950,256,16,4096,1536,4096,mslk,127.56,0,0.5,404.05,1940.03,127.56,160.00
++gfx950,256,16,4096,1536,8192,mslk,196.66,0,0.5001,524.16,1492.96,196.66,240.29
++gfx950,256,16,4096,1536,16384,mslk,335.04,0,0.5,615.32,1151.71,335.04,384.59
++gfx950,256,16,4096,1536,32768,mslk,624.00,0,0.5001,660.77,914.15,624.00,690.58
++gfx950,256,16,5120,8192,1,mslk,126.69,0,0.9961,0.66,10594.77,126.69,256.66
++gfx950,256,16,5120,8192,2,mslk,126.80,0,0.9817,1.32,10585.12,126.80,257.73
++gfx950,256,16,5120,8192,4,mslk,140.60,0,0.9993,2.39,9546.65,140.60,294.29
++gfx950,256,16,5120,8192,8,mslk,155.14,0,0.9937,4.33,8652.91,155.14,297.77
++gfx950,256,16,5120,8192,16,mslk,218.24,0,0.9985,6.15,6152.05,218.24,346.16
++gfx950,256,16,5120,8192,32,mslk,186.53,0,0.9984,14.39,7200.00,186.53,327.59
++gfx950,256,16,5120,8192,64,mslk,221.25,0,0.9989,24.27,6074.13,221.25,367.68
++gfx950,256,16,5120,8192,128,mslk,338.09,0,0.9997,31.76,3979.94,338.09,625.98
++gfx950,256,16,5120,8192,256,mslk,309.32,0,0.9998,69.43,4361.19,309.32,608.29
++gfx950,256,16,5120,8192,512,mslk,299.04,0,1,143.62,4533.82,299.04,399.86
++gfx950,256,16,5120,8192,1024,mslk,365.78,0,1,234.84,3743.91,365.78,625.64
++gfx950,256,16,5120,8192,2048,mslk,518.57,0,1,331.30,2693.39,518.57,718.80
++gfx950,256,16,5120,8192,4096,mslk,753.68,0,1.001,455.89,1925.53,753.68,857.43
++gfx950,256,16,5120,8192,8192,mslk,1217.37,0,1.142,564.49,1281.69,1217.37,1211.87
++gfx950,256,16,5120,8192,16384,aiter,1843.10,0,1.162,745.69,964.89,2078.25,1843.10
++gfx950,256,16,5120,8192,32768,aiter,3307.52,0,1.79,831.07,669.56,3895.00,3307.52
++gfx950,256,16,5760,2880,1,mslk,47.63,0,0.4995,0.70,11146.56,47.63,99.26
++gfx950,256,16,5760,2880,2,mslk,47.86,0,0.4988,1.39,11092.32,47.86,100.00
++gfx950,256,16,5760,2880,4,mslk,52.40,0,0.4994,2.53,10132.53,52.40,115.61
++gfx950,256,16,5760,2880,8,mslk,55.19,0,0.4997,4.81,9620.37,55.19,119.19
++gfx950,256,16,5760,2880,16,mslk,55.21,0,0.4998,9.62,9620.47,55.21,119.30
++gfx950,256,16,5760,2880,32,mslk,71.69,0,0.5001,14.81,7412.53,71.69,132.91
++gfx950,256,16,5760,2880,64,mslk,90.73,0,0.5839,23.40,5863.18,90.73,151.57
++gfx950,256,16,5760,2880,128,mslk,107.31,0,0.5,39.58,4967.55,107.31,233.14
++gfx950,256,16,5760,2880,256,mslk,112.92,0,0.6034,75.22,4740.18,112.92,233.37
++gfx950,256,16,5760,2880,512,mslk,131.14,0,0.783,129.53,4115.22,131.14,246.09
++gfx950,256,16,5760,2880,1024,mslk,175.30,0,0.9615,193.81,3129.18,175.30,259.18
++gfx950,256,16,5760,2880,2048,mslk,209.05,0,0.9903,325.03,2708.55,209.05,280.57
++gfx950,256,16,5760,2880,4096,mslk,321.97,0,0.9626,422.08,1868.57,321.97,395.07
++gfx950,256,16,5760,2880,8192,mslk,525.14,0,0.9998,517.56,1280.43,525.14,553.24
++gfx950,256,16,5760,2880,16384,mslk,947.60,0,0.9988,573.64,858.97,947.60,926.44
++gfx950,256,16,5760,2880,32768,aiter,1665.16,0,0.9973,652.89,658.84,1778.20,1665.16
++gfx950,256,16,16384,5120,1,mslk,83.15,0,0.5565,2.02,32284.34,83.15,169.77
++gfx950,256,16,16384,5120,2,mslk,109.47,0,0.8923,3.07,24521.77,109.47,210.54
++gfx950,256,16,16384,5120,4,mslk,149.44,0,0.9482,4.49,17963.43,149.44,234.53
++gfx950,256,16,16384,5120,8,mslk,216.13,0,0.9937,6.21,12421.56,216.13,418.11
++gfx950,256,16,16384,5120,16,mslk,291.87,0,0.9957,9.20,9199.45,291.87,494.79
++gfx950,256,16,16384,5120,32,mslk,291.71,0,0.9944,18.40,9207.01,291.71,512.25
++gfx950,256,16,16384,5120,64,mslk,373.33,0,0.9971,28.76,7197.68,373.33,683.84
++gfx950,256,16,16384,5120,128,mslk,518.29,0,0.9999,41.43,5189.92,518.29,924.08
++gfx950,256,16,16384,5120,256,mslk,497.65,0,0.9993,86.31,5416.23,497.65,774.20
++gfx950,256,16,16384,5120,512,mslk,645.75,0,0.9995,133.02,4191.05,645.75,995.63
++gfx950,256,16,16384,5120,1024,mslk,786.27,0,1,218.50,3470.06,786.27,1035.38
++gfx950,256,16,16384,5120,2048,mslk,1019.69,0,1,336.96,2718.91,1019.69,1254.63
++gfx950,256,16,16384,5120,4096,aiter,1293.82,0,1,531.14,2210.91,1562.78,1293.82
++gfx950,256,16,16384,5120,8192,aiter,2209.80,0,1,621.95,1374.18,2407.09,2209.80
++gfx950,256,16,16384,5120,16384,aiter,3676.99,0,1,747.56,921.68,4231.47,3676.99
++gfx950,256,16,16384,5120,32768,aiter,6920.23,0,1,794.42,591.55,7920.74,6920.23
++gfx950,256,32,4096,7168,1,mslk,95.32,0,0.7971,0.62,19713.31,95.32,231.28
++gfx950,256,32,4096,7168,2,mslk,95.53,0,0.9905,1.23,19670.12,95.53,231.76
++gfx950,256,32,4096,7168,4,mslk,95.93,0,0.9974,2.45,19589.00,95.93,248.39
++gfx950,256,32,4096,7168,8,mslk,122.84,0,0.9947,3.82,15297.85,122.84,273.51
++gfx950,256,32,4096,7168,16,mslk,157.14,0,0.9991,5.98,11960.37,157.14,281.61
++gfx950,256,32,4096,7168,32,mslk,179.05,0,0.9994,10.49,10498.61,179.05,326.81
++gfx950,256,32,4096,7168,64,mslk,275.74,0,0.999,13.63,6819.82,275.74,545.90
++gfx950,256,32,4096,7168,128,mslk,321.74,0,0.9997,23.36,5849.18,321.74,563.09
++gfx950,256,32,4096,7168,256,mslk,396.14,0,1,37.95,4757.96,396.14,645.67
++gfx950,256,32,4096,7168,512,mslk,424.73,0,0.9998,70.79,4451.29,424.73,671.09
++gfx950,256,32,4096,7168,1024,mslk,432.34,0,1,139.08,4399.62,432.34,672.71
++gfx950,256,32,4096,7168,2048,mslk,550.80,0,1,218.34,3495.28,550.80,749.55
++gfx950,256,32,4096,7168,4096,mslk,732.53,0,1,328.34,2691.11,732.53,989.54
++gfx950,256,32,4096,7168,8192,mslk,1025.78,0,1,468.94,2011.73,1025.78,1099.70
++gfx950,256,32,4096,7168,16384,mslk,1623.16,0,1,592.71,1385.04,1623.16,1591.90
++gfx950,256,32,4096,7168,32768,aiter,2694.87,0,1.001,714.00,971.19,3130.53,2694.87
++gfx950,256,32,7168,2048,1,mslk,33.68,0,0.4979,0.87,27899.47,33.68,81.14
++gfx950,256,32,7168,2048,2,mslk,34.37,0,0.4957,1.71,27335.06,34.37,81.21
++gfx950,256,32,7168,2048,4,mslk,35.23,0,0.4996,3.33,26672.16,35.23,81.56
++gfx950,256,32,7168,2048,8,mslk,41.94,0,0.4984,5.60,22407.01,41.94,88.79
++gfx950,256,32,7168,2048,16,mslk,91.57,0,0.4999,5.13,10263.72,91.57,172.55
++gfx950,256,32,7168,2048,32,mslk,117.21,0,0.4998,8.02,8020.96,117.21,198.91
++gfx950,256,32,7168,2048,64,mslk,165.02,0,0.5,11.39,5700.64,165.02,285.77
++gfx950,256,32,7168,2048,128,mslk,191.39,0,0.4999,19.64,4921.23,191.39,319.11
++gfx950,256,32,7168,2048,256,mslk,181.70,0,0.5,41.37,5196.69,181.70,291.12
++gfx950,256,32,7168,2048,512,mslk,216.93,0,0.5,69.30,4374.55,216.93,323.67
++gfx950,256,32,7168,2048,1024,mslk,236.38,0,0.5524,127.19,4054.40,236.38,393.24
++gfx950,256,32,7168,2048,2048,mslk,246.63,0,0.5001,243.81,3962.54,246.63,335.73
++gfx950,256,32,7168,2048,4096,mslk,337.67,0,0.5002,356.14,3005.94,337.67,438.53
++gfx950,256,32,7168,2048,8192,mslk,494.67,0,0.8308,486.22,2204.53,494.67,626.92
++gfx950,256,32,7168,2048,16384,mslk,826.21,0,0.5002,582.22,1502.66,826.21,978.43
++gfx950,256,32,7168,2048,32768,mslk,1530.80,0,0.8933,628.48,1008.30,1530.80,1659.26
++gfx950,256,128,3072,4096,1,mslk,71.26,0,0.4919,0.35,45204.74,71.26,178.14
++gfx950,256,128,3072,4096,2,mslk,79.40,0,0.4975,0.63,40572.12,79.40,177.91
++gfx950,256,128,3072,4096,4,mslk,85.48,0,0.4995,1.18,37684.18,85.48,180.01
++gfx950,256,128,3072,4096,8,mslk,108.51,0,0.6315,1.86,29686.90,108.51,179.42
++gfx950,256,128,3072,4096,16,mslk,161.94,0,0.8517,2.49,19892.41,161.94,203.36
++gfx950,256,128,3072,4096,32,mslk,217.40,0,0.9886,3.70,14819.06,217.40,345.44
++gfx950,256,128,3072,4096,64,mslk,369.90,0,0.9775,4.35,8710.87,369.90,510.98
++gfx950,256,128,3072,4096,128,mslk,407.89,0,0.9894,7.90,7901.79,407.89,542.75
++gfx950,256,128,3072,4096,256,mslk,565.01,0,0.9942,11.40,5707.73,565.01,733.70
++gfx950,256,128,3072,4096,512,mslk,670.99,0,0.9996,19.20,4811.65,670.99,799.71
++gfx950,256,128,3072,4096,1024,mslk,761.09,0,0.9972,33.86,4251.65,761.09,947.02
++gfx950,256,128,3072,4096,2048,mslk,852.52,0,1,60.46,3812.92,852.52,1038.71
++gfx950,256,128,3072,4096,4096,mslk,865.85,0,0.9997,119.05,3788.11,865.85,1030.07
++gfx950,256,128,3072,4096,8192,mslk,1200.23,0,1,171.77,2781.69,1200.23,1212.08
++gfx950,256,128,3072,4096,16384,mslk,1548.33,0,0.9995,266.30,2232.15,1548.33,1574.32
++gfx950,256,128,3072,4096,32768,aiter,2103.78,0,0.9999,391.98,1754.45,2412.70,2103.78
+diff --git a/mslk/gemm/triton/grouped_gemm.py b/mslk/gemm/triton/grouped_gemm.py
+index ade51ce..2b941b8 100644
+--- a/mslk/gemm/triton/grouped_gemm.py
++++ b/mslk/gemm/triton/grouped_gemm.py
+@@ -1612,7 +1612,12 @@ def _register_rocm_grad_ops() -> None:
+         out: Optional[torch.Tensor] = None,
+         num_sms: Optional[int] = None,
+     ) -> torch.Tensor:
+-        return grouped_gemm_dgrad(X, W, M_sizes, out=out, num_sms=num_sms)
++        # Imported on first call, like the backends it chooses between.
++        from mslk.gemm.dispatch.bf16bf16bf16_grouped_grad import (
++            ROUTING as _grouped_grad_routing,
++        )
++
++        return _grouped_grad_routing(X, W, M_sizes, out, num_sms)
+ 
+     @torch.library.impl("mslk::bf16bf16bf16_grouped_wgrad", "CUDA")
+     def _bf16_grouped_wgrad_impl(
+diff --git a/test/aiter/lazy_import_test.py b/test/aiter/lazy_import_test.py
+index 23cc58b..d8b9f71 100644
+--- a/test/aiter/lazy_import_test.py
++++ b/test/aiter/lazy_import_test.py
+@@ -25,6 +25,10 @@ class LazyAiterImportTest(unittest.TestCase):
+             "mslk.aiter.routing",
+             "mslk.gemm.aiter.f4f4bf16",
+             "mslk.gemm.dispatch.f4f4bf16",
++            "mslk.gemm.aiter.bf16bf16bf16_grouped_stacked",
++            "mslk.gemm.dispatch.bf16bf16bf16_grouped_stacked",
++            "mslk.gemm.aiter.bf16bf16bf16_grouped_grad",
++            "mslk.gemm.dispatch.bf16bf16bf16_grouped_grad",
+         ):
+             importlib.import_module(module)
+ 
+diff --git a/test/gemm/dispatch_test.py b/test/gemm/dispatch_test.py
+index 50695ce..e58e622 100644
+--- a/test/gemm/dispatch_test.py
++++ b/test/gemm/dispatch_test.py
+@@ -20,7 +20,11 @@ import mslk.gemm  # noqa: F401
+ import torch
+ from mslk.aiter.common import is_aiter_available
+ from mslk.aiter.routing import device_key, OpRouting
+-from mslk.gemm.dispatch import f4f4bf16
++from mslk.gemm.dispatch import (
++    bf16bf16bf16_grouped_grad,
++    bf16bf16bf16_grouped_stacked,
++    f4f4bf16,
++)
+ from mslk.quantize.triton.fp4_quantize import triton_quantize_mx4_unpack
+ from mslk.testing.device import skipUnlessRocm
+ from parameterized import parameterized
+@@ -39,6 +43,29 @@ def _f4f4bf16_args(row: Dict[str, str]) -> Args:
+     return (aq, bq, a_scale, b_scale), {}
+ 
+ 
++def _group_sizes(M: int, G: int) -> torch.Tensor:
++    """M rows spread as evenly as possible over G groups."""
++    sizes = torch.full((G,), M // G, dtype=torch.int64)
++    sizes[: M % G] += 1
++    return sizes.cuda()
++
++
++def _bf16bf16bf16_grouped_stacked_args(row: Dict[str, str]) -> Args:
++    M, G = int(row["M_max"]), int(row["G"])
++    N, K = int(row["N"]), int(row["K"])
++    X = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
++    W = torch.randn(G, N, K, device="cuda", dtype=torch.bfloat16)
++    return (X, W, _group_sizes(M, G)), {}
++
++
++def _bf16bf16bf16_grouped_grad_args(row: Dict[str, str]) -> Args:
++    M, G = int(row["M_max"]), int(row["G"])
++    N, K = int(row["N"]), int(row["K"])
++    X = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
++    W = torch.randn(G, K, N, device="cuda", dtype=torch.bfloat16).permute(0, 2, 1)
++    return (X, W, _group_sizes(M, G)), {}
++
++
+ # (name, routing, the registered op, arguments for a table row)
+ CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
+     (
+@@ -47,6 +74,18 @@ CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
+         lambda *a, **kw: torch.ops.mslk.f4f4bf16(*a, **kw),
+         _f4f4bf16_args,
+     ),
++    (
++        "bf16bf16bf16_grouped_stacked",
++        bf16bf16bf16_grouped_stacked.ROUTING,
++        lambda *a, **kw: torch.ops.mslk.bf16bf16bf16_grouped_stacked(*a, **kw),
++        _bf16bf16bf16_grouped_stacked_args,
++    ),
++    (
++        "bf16bf16bf16_grouped_grad",
++        bf16bf16bf16_grouped_grad.ROUTING,
++        lambda *a, **kw: torch.ops.mslk.bf16bf16bf16_grouped_grad(*a, **kw),
++        _bf16bf16bf16_grouped_grad_args,
++    ),
+ ]
+ 
+ 
+diff --git a/test/gemm/gemm_test.py b/test/gemm/gemm_test.py
+index 2642299..8dd43d9 100644
+--- a/test/gemm/gemm_test.py
++++ b/test/gemm/gemm_test.py
+@@ -16,13 +16,21 @@ import mslk.gemm  # noqa: F401
+ import mslk.quantize  # noqa: F401
+ import torch
+ import triton  # noqa: F401
+-from mslk.aiter.common import is_aiter_available
+-from mslk.aiter.routing import force_backend
++from mslk.aiter.common import is_aiter_available, is_aiter_enabled
++from mslk.aiter.routing import device_key, force_backend, OpRouting
+ from mslk.flydsl.common import (
+     flydsl_version,
+     is_flydsl_version_at_least,
+     MIN_FLYDSL_VERSION,
+ )
++from mslk.gemm.dispatch.bf16bf16bf16_grouped_grad import (
++    OP as BF16_GROUPED_GRAD_OP,
++    ROUTING as BF16_GROUPED_GRAD_ROUTING,
++)
++from mslk.gemm.dispatch.bf16bf16bf16_grouped_stacked import (
++    OP as BF16_GROUPED_STACKED_OP,
++    ROUTING as BF16_GROUPED_STACKED_ROUTING,
++)
+ from mslk.gemm.dispatch.f4f4bf16 import OP as F4F4BF16_OP, ROUTING as F4F4BF16_ROUTING
+ from mslk.quantize.triton.fp4_quantize import (
+     _to_blocked,
+@@ -356,6 +364,44 @@ class F8F8F16RowwiseCompileTests(unittest.TestCase):
+         )
+ 
+ 
++# (G, N, K, M) shapes that the BF16 grouped ops' tuning tables route to aiter on
++# gfx950, so that the ops' tests cover aiter's kernel as well as MSLK's.
++_BF16_GROUPED_STACKED_AITER_SHAPES: tuple[tuple[int, int, int, int], ...] = (
++    (8, 28672, 4096, 3000),
++    (16, 16384, 5120, 3000),
++)
++_BF16_GROUPED_GRAD_AITER_SHAPES: tuple[tuple[int, int, int, int], ...] = (
++    (8, 14336, 4096, 6000),
++    (32, 7168, 4096, 20000),
++)
++
++
++def _uneven_m_sizes(G: int, M: int, device: torch.device) -> torch.Tensor:
++    """M rows over G groups, skewed as MoE routing makes them; some empty."""
++    weights = torch.rand(G).pow(3) + 1e-3
++    picks = torch.multinomial(weights, M, replacement=True)
++    return torch.bincount(picks, minlength=G).to(device=device, dtype=torch.int64)
++
++
++def _grouped_reference(
++    x: torch.Tensor, w_kn: torch.Tensor, m_sizes: torch.Tensor
++) -> torch.Tensor:
++    """FP32 ``x[g] @ w_kn[g]`` for each group ``g`` of the rows of ``x``."""
++    out = torch.empty(x.shape[0], w_kn.shape[2], dtype=torch.float32, device=x.device)
++    start = 0
++    for g, size in enumerate(m_sizes.tolist()):
++        out[start : start + size] = x[start : start + size].float() @ w_kn[g].float()
++        start += size
++    return out
++
++
++def _table_covers_device(routing: OpRouting) -> bool:
++    gfx, cu_num = device_key(torch.cuda.current_device())
++    return any(
++        (r["gfx"], r["cu_num"]) == (gfx, str(cu_num)) for r in routing.table.rows
++    )
++
++
+ @skipUnlessGfxArch("gfx942", "gfx950")
+ @skipUnlessCudaCapability(9, 10)
+ class FP8Tests(unittest.TestCase):
+@@ -1285,6 +1331,60 @@ class FP8Tests(unittest.TestCase):
+ 
+         torch.testing.assert_close(actual, expected, atol=8.0e-3, rtol=8.0e-3)
+ 
++    @skipUnlessRocm()
++    @parameterized.expand(
++        [
++            (*shape, backend)
++            for shape in (
++                (4, 512, 256, 1),  # one row
++                (16, 2880, 2880, 300),  # K == N
++                (32, 4096, 7168, 100),  # in the tuning table, routed to MSLK
++                (128, 3072, 4096, 64),  # more groups than rows
++                *_BF16_GROUPED_STACKED_AITER_SHAPES,
++            )
++            for backend in ("default", "mslk", "aiter")
++        ]
++    )
++    def test_bf16_grouped_stacked_backends(
++        self, G: int, N: int, K: int, M: int, backend: str
++    ) -> None:
++        op, routing = BF16_GROUPED_STACKED_OP, BF16_GROUPED_STACKED_ROUTING
++        if backend == "aiter" and not is_aiter_enabled(op):
++            self.skipTest("requires the pinned aiter, enabled for the op")
++        torch.manual_seed(hash((G, N, K, M)))
++        M_sizes = _uneven_m_sizes(G, M, self.device)
++        x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
++        w = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device)
++        out = torch.full(
++            (M * N,), float("nan"), dtype=torch.bfloat16, device=self.device
++        )
++        args = (x, w, M_sizes, out)
++
++        with (
++            force_backend(op, backend)
++            if backend != "default"
++            else contextlib.nullcontext()
++        ):
++            served_by = routing.backend_for(*args)
++            actual = torch.ops.mslk.bf16bf16bf16_grouped_stacked(*args)
++
++        self.assertEqual(actual.data_ptr(), out.data_ptr())
++        expected = _grouped_reference(x, w.transpose(1, 2), M_sizes)
++        torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
++        if backend != "default":
++            self.assertEqual(served_by, backend)
++        elif (
++            (G, N, K, M) in _BF16_GROUPED_STACKED_AITER_SHAPES
++            and is_aiter_enabled(op)
++            and _table_covers_device(routing)
++        ):
++            self.assertEqual(
++                served_by,
++                "aiter",
++                "the tuning table no longer routes this shape to aiter; replace "
++                "it in _BF16_GROUPED_STACKED_AITER_SHAPES with one it does",
++            )
++
+     @skipUnlessRocm()
+     def test_packed_large_operand_uses_tile_descriptors(self) -> None:
+         from mslk.gemm.flydsl.grouped_dispatch import (
+@@ -2813,6 +2913,61 @@ class BF16Tests(unittest.TestCase):
+             y_half_preallocated, ref_y_half, atol=1e-3, rtol=1.6e-2
+         )
+ 
++    @skipUnlessRocm()
++    @parameterized.expand(
++        [
++            (*shape, backend)
++            for shape in (
++                (4, 512, 256, 1),  # one row
++                (8, 1024, 2048, 37),  # groups smaller than a tile
++                (16, 2880, 2880, 300),  # K == N: aiter cannot take it
++                (32, 7168, 4096, 100),  # in the tuning table, routed to MSLK
++                *_BF16_GROUPED_GRAD_AITER_SHAPES,
++            )
++            for backend in ("default", "mslk", "aiter")
++        ]
++    )
++    def test_grouped_gemm_dgrad_backends(
++        self, G: int, N: int, K: int, M: int, backend: str
++    ) -> None:
++        op, routing = BF16_GROUPED_GRAD_OP, BF16_GROUPED_GRAD_ROUTING
++        if backend == "aiter" and not is_aiter_enabled(op):
++            self.skipTest("requires the pinned aiter, enabled for the op")
++        torch.manual_seed(hash((G, N, K, M)))
++        m_sizes = _uneven_m_sizes(G, M, self.device)
++        x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
++        # The forward weight [G, K, N]; the op takes its [G, N, K] view.
++        w = torch.randn((G, K, N), dtype=torch.bfloat16, device=self.device)
++        out = torch.full(
++            (M * N,), float("nan"), dtype=torch.bfloat16, device=self.device
++        )
++        args = (x, w.permute(0, 2, 1), m_sizes, out)
++
++        with (
++            force_backend(op, backend)
++            if backend != "default"
++            else contextlib.nullcontext()
++        ):
++            served_by = routing.backend_for(*args)
++            actual = torch.ops.mslk.bf16bf16bf16_grouped_grad(*args)
++
++        expected = _grouped_reference(x, w, m_sizes)
++        torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
++        if backend != "default":
++            # aiter cannot take K == N; such calls go to MSLK's kernel.
++            self.assertEqual(served_by, "mslk" if K == N else backend)
++        elif (
++            (G, N, K, M) in _BF16_GROUPED_GRAD_AITER_SHAPES
++            and is_aiter_enabled(op)
++            and _table_covers_device(routing)
++        ):
++            self.assertEqual(
++                served_by,
++                "aiter",
++                "the tuning table no longer routes this shape to aiter; replace "
++                "it in _BF16_GROUPED_GRAD_AITER_SHAPES with one it does",
++            )
++
+     @parameterized.expand(
+         [
+             (*case, dtype)
+-- 
+2.43.0
+

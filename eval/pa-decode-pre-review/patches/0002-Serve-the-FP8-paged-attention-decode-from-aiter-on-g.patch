@@ -1,0 +1,2922 @@
+From 3cfd2153c058dfaa83e761e92b1957569c52b126 Mon Sep 17 00:00:00 2001
+From: amd-weisun <Wei.Sun@amd.com>
+Date: Wed, 18 Nov 2026 15:11:22 +0000
+Subject: [PATCH 2/2] Serve the FP8 paged-attention decode from aiter on gfx950
+ where it is faster
+
+paged_attention_decode_fp8 now picks per shape between MSLK's FlyDSL kernel
+and aiter's FlyDSL pa_decode, which takes the op's cache layout, scales and
+block tables as they are. aiter's ASM pa_fwd_asm is not a candidate: its
+softmax scale is fixed to 1/sqrt(128), it takes only block size 16, and it was
+slower than both.
+
+- mslk/attention/aiter/paged_attention_decode_fp8.py: builds aiter's work plan
+  on the GPU and calls pa_decode; aiter uses its own scratch.
+- mslk/attention/dispatch/paged_attention_decode_fp8.py: the backends, which
+  calls aiter takes, and the table key: heads, head size, block size and the
+  context the block table holds (rounded up to a power of two), with the batch
+  size as the bucket. All come from shapes, so a CUDA graph replays the backend
+  it was captured with.
+- bench/aiter/tune_paged_attention_decode_fp8.py and its shape list; the table
+  in mslk/attention/dispatch/tables/. aiter serves 323 of 1008 rows.
+- Tests: the op's tests run through the routing and with each backend forced,
+  plus shapes the table sends to each backend and a call aiter cannot take;
+  test/attention/dispatch_test.py and the lazy-import test gain the op.
+  package_data, the ROCm CI path filter and the CI test list gain the files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .github/workflows/mslk_ci_rocm.yml            |    4 +
+ .../aiter/tune_paged_attention_decode_fp8.py  |  201 ++++
+ .../untuned/paged_attention_decode_fp8.csv    | 1016 +++++++++++++++++
+ ci/scripts/mslk_test.bash                     |    1 +
+ mslk/attention/aiter/__init__.py              |   13 +
+ .../aiter/paged_attention_decode_fp8.py       |   62 +
+ mslk/attention/dispatch/__init__.py           |   14 +
+ .../dispatch/paged_attention_decode_fp8.py    |  144 +++
+ .../tables/paged_attention_decode_fp8.csv     | 1009 ++++++++++++++++
+ .../flydsl/decode/pa_decode_fp8_dispatch.py   |   44 +-
+ setup.py                                      |    1 +
+ test/aiter/lazy_import_test.py                |    3 +
+ test/attention/dispatch_test.py               |  109 ++
+ test/attention/flydsl/pa_decode_fp8_test.py   |   94 +-
+ 14 files changed, 2703 insertions(+), 12 deletions(-)
+ create mode 100644 bench/aiter/tune_paged_attention_decode_fp8.py
+ create mode 100644 bench/aiter/untuned/paged_attention_decode_fp8.csv
+ create mode 100644 mslk/attention/aiter/__init__.py
+ create mode 100644 mslk/attention/aiter/paged_attention_decode_fp8.py
+ create mode 100644 mslk/attention/dispatch/__init__.py
+ create mode 100644 mslk/attention/dispatch/paged_attention_decode_fp8.py
+ create mode 100644 mslk/attention/dispatch/tables/paged_attention_decode_fp8.csv
+ create mode 100644 test/attention/dispatch_test.py
+
+diff --git a/.github/workflows/mslk_ci_rocm.yml b/.github/workflows/mslk_ci_rocm.yml
+index 611a054..11b714c 100644
+--- a/.github/workflows/mslk_ci_rocm.yml
++++ b/.github/workflows/mslk_ci_rocm.yml
+@@ -56,6 +56,10 @@ on:
+       - 'mslk/gemm/dispatch/**'
+       - 'test/aiter/**'
+       - 'bench/aiter/**'
++      # aiter backends of attention ops and their tuning tables
++      - 'mslk/attention/aiter/**'
++      - 'mslk/attention/dispatch/**'
++      - 'test/attention/dispatch_test.py'
+       # GEMM tests
+       - 'test/gemm/gemm_test.py'
+       - 'test/gemm/dispatch_test.py'
+diff --git a/bench/aiter/tune_paged_attention_decode_fp8.py b/bench/aiter/tune_paged_attention_decode_fp8.py
+new file mode 100644
+index 0000000..9dd9a57
+--- /dev/null
++++ b/bench/aiter/tune_paged_attention_decode_fp8.py
+@@ -0,0 +1,201 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Tune which backend serves ``paged_attention_decode_fp8`` on gfx950, per shape.
++
++Compares MSLK's FlyDSL kernel with aiter's FlyDSL ``pa_decode`` on every shape
++in ``bench/aiter/untuned/paged_attention_decode_fp8.csv`` and updates
++``mslk/attention/dispatch/tables/paged_attention_decode_fp8.csv``. The tuning
++itself (incremental runs, multi-GPU, timing, choosing) is
++:mod:`mslk.aiter.tuning`; this file holds only what is specific to the op.
++Needs the pinned aiter and a gfx950 GPU.
++
++Inputs: ``batch_max`` sequences, each with its own pages of a per-token FP8
++cache in random order, and a block table ``context_max`` tokens wide. Lengths
++are spread evenly over (context_max / 2, context_max].
++
++Correctness: the reference is attention over the dequantized cache in FP32.
++The kernels also round the query and the softmax probabilities to FP8, which
++puts a few elements up to 20% of the output scale off, hence
++rtol = atol = 0.3. The values of each sequence are scaled by the square root
++of its length so that its outputs are O(1) at any length; then a wrong head,
++page or length fails by several times the tolerance, except for a few missing
++tokens of a long sequence.
++
++Example, on four GPUs (run from the repository root):
++
++    HIP_VISIBLE_DEVICES=0,1,2,3 python bench/aiter/tune_paged_attention_decode_fp8.py --mp 4
++"""
++
++from pathlib import Path
++from typing import Any, Dict, List
++
++import torch
++from mslk.aiter import tuning
++from mslk.aiter.tuning import OpTuner, Row
++from mslk.attention.dispatch.paged_attention_decode_fp8 import BACKENDS, OP
++from mslk.attention.flydsl.decode.pa_decode_fp8 import (
++    get_recommended_splits,
++    KV_COMPUTE_BLOCK,
++)
++from mslk.attention.flydsl.decode.pa_decode_fp8_dispatch import (
++    paged_attention_decode_fp8,
++)
++
++REPO = Path(__file__).resolve().parents[2]
++FP8 = torch.float8_e4m3fn
++
++
++def _lengths(shape: Row) -> List[int]:
++    batch, context = int(shape["batch_max"]), int(shape["context_max"])
++    return [context - context // 2 * b // batch for b in range(batch)]
++
++
++def _quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    scale = x.abs().amax(-1, keepdim=True) / torch.finfo(FP8).max
++    return (x / scale).to(FP8), scale
++
++
++class PagedAttentionDecodeFP8Tuner(OpTuner):
++    op = OP
++    key_columns = (
++        "num_heads",
++        "num_kv_heads",
++        "head_size",
++        "block_size",
++        "context_max",
++    )
++    bucket_column = "batch_max"
++    backends = BACKENDS
++    atol = rtol = 0.3
++    outputs = ("output",)
++
++    def make_inputs(self, shape: Row) -> Dict[str, Any]:
++        heads, kv_heads = int(shape["num_heads"]), int(shape["num_kv_heads"])
++        head_size, block_size = int(shape["head_size"]), int(shape["block_size"])
++        lengths = _lengths(shape)
++        pages = [-(-n // block_size) for n in lengths]
++        num_blocks = sum(pages) + 1
++        width = int(shape["context_max"]) // block_size
++        block_tables = torch.full(
++            (len(lengths), width), -1, dtype=torch.int32, device="cuda"
++        )
++        order = torch.randperm(num_blocks, dtype=torch.int32, device="cuda")
++        value_size = torch.ones(num_blocks, 1, 1, 1, device="cuda")
++        start = 0
++        for b, n in enumerate(pages):
++            block_tables[b, :n] = order[start : start + n]
++            value_size[order[start : start + n].long()] = lengths[b] ** 0.5
++            start += n
++
++        cache = (num_blocks, kv_heads, block_size, head_size)
++        kq, key_scale = _quantize(torch.randn(cache, device="cuda"))
++        vq, value_scale = _quantize(
++            (torch.rand(cache, device="cuda") * 2 - 1) * value_size
++        )
++        del value_size
++        query = torch.randn(
++            len(lengths), heads, head_size, dtype=torch.bfloat16, device="cuda"
++        )
++        # MSLK's kernel needs its scratch preallocated to be captured in a CUDA
++        # graph; aiter's backend leaves it unused.
++        parts = get_recommended_splits(
++            len(lengths), kv_heads, split_kv_blocks=KV_COMPUTE_BLOCK // block_size
++        )
++        scratch = (len(lengths), kv_heads, parts, heads // kv_heads)
++        return {
++            "output": torch.empty_like(query),
++            "query": query,
++            # [blocks, kv_heads, head_size / 16, block_size, 16]
++            "key_cache": kq.view(*cache[:3], head_size // 16, 16)
++            .permute(0, 1, 3, 2, 4)
++            .contiguous(),
++            # [blocks, kv_heads, block_size / 16, head_size, 16]
++            "value_cache": vq.view(*cache[:2], block_size // 16, 16, head_size)
++            .transpose(3, 4)
++            .contiguous(),
++            "context_lengths": torch.tensor(lengths, dtype=torch.int32, device="cuda"),
++            "block_tables": block_tables,
++            "key_scale": key_scale,
++            "value_scale": value_scale,
++            "max_context_partition_num": parts,
++            "exp_sums": torch.empty(scratch, device="cuda"),
++            "max_logits": torch.empty(scratch, device="cuda"),
++            "temporary_output": torch.empty(
++                *scratch, head_size, dtype=torch.bfloat16, device="cuda"
++            ),
++        }
++
++    def run(self, inputs: Dict[str, Any]) -> torch.Tensor:
++        query = inputs["query"]
++        paged_attention_decode_fp8(
++            inputs["output"],
++            query,
++            inputs["key_cache"],
++            inputs["value_cache"],
++            inputs["context_lengths"],
++            inputs["block_tables"],
++            query.shape[-1] ** -0.5,
++            inputs["key_scale"],
++            inputs["value_scale"],
++            max_context_partition_num=inputs["max_context_partition_num"],
++            exp_sums=inputs["exp_sums"],
++            max_logits=inputs["max_logits"],
++            temporary_output=inputs["temporary_output"],
++        )
++        return inputs["output"]
++
++    def reference(self, shape: Row, inputs: Dict[str, Any]) -> torch.Tensor:
++        query, key_cache = inputs["query"], inputs["key_cache"]
++        kv_heads, block_size = key_cache.shape[1], key_cache.shape[3]
++        head_size = query.shape[-1]
++        out = torch.empty(query.shape, dtype=torch.float32, device="cuda")
++        for b, n in enumerate(_lengths(shape)):
++            blocks = inputs["block_tables"][b, : -(-n // block_size)].long()
++            # The sequence's keys and values as [tokens, kv_heads, head_size].
++            k = key_cache[blocks].permute(0, 3, 1, 2, 4)
++            v = inputs["value_cache"][blocks].permute(0, 2, 4, 1, 3)
++            k_scale = inputs["key_scale"][blocks].transpose(1, 2)
++            v_scale = inputs["value_scale"][blocks].transpose(1, 2)
++            k = k.reshape(-1, kv_heads, head_size).float() * k_scale.reshape(
++                -1, kv_heads, 1
++            )
++            v = v.reshape(-1, kv_heads, head_size).float() * v_scale.reshape(
++                -1, kv_heads, 1
++            )
++            k, v = k[:n], v[:n]
++            q = query[b].float().view(kv_heads, -1, head_size)
++            scores = torch.einsum("hgd,thd->hgt", q, k) * head_size**-0.5
++            out[b] = torch.einsum("hgt,thd->hgd", scores.softmax(-1), v).flatten(0, 1)
++        return out
++
++    def flops(self, shape: Row) -> float:
++        tokens = sum(_lengths(shape))
++        return 4.0 * tokens * int(shape["num_heads"]) * int(shape["head_size"])
++
++    def bytes_moved(self, shape: Row) -> float:
++        # FP8 K and V, one FP32 scale each per token; the queries and outputs
++        # are negligible.
++        tokens = sum(_lengths(shape))
++        kv_heads, head_size = int(shape["num_kv_heads"]), int(shape["head_size"])
++        return tokens * kv_heads * (2 * head_size + 8)
++
++
++if __name__ == "__main__":
++    tuning.main(
++        PagedAttentionDecodeFP8Tuner(),
++        untune_file=str(
++            REPO / "bench" / "aiter" / "untuned" / "paged_attention_decode_fp8.csv"
++        ),
++        tune_file=str(
++            REPO
++            / "mslk"
++            / "attention"
++            / "dispatch"
++            / "tables"
++            / "paged_attention_decode_fp8.csv"
++        ),
++    )
+diff --git a/bench/aiter/untuned/paged_attention_decode_fp8.csv b/bench/aiter/untuned/paged_attention_decode_fp8.csv
+new file mode 100644
+index 0000000..79fb59c
+--- /dev/null
++++ b/bench/aiter/untuned/paged_attention_decode_fp8.csv
+@@ -0,0 +1,1016 @@
++# Shapes tuned for paged_attention_decode_fp8; each row becomes one row of its
++# tuning table. batch_max is the batch bucket's bound (see mslk/aiter/routing.py);
++# context_max is the context the block table holds, a power of two.
++# Initial list: the attention heads of public models with head size 128, per GPU
++# unsharded and 8-way tensor-parallel: Llama 3 8B (32, 8; 4, 1), Llama 3 70B and
++# Qwen2.5 72B (64, 8; 8, 1), Llama 3 405B (128, 8; 16, 1); block sizes 16 and 64;
++# contexts 256 to 128k; batches 1 to 256, up to 4M tokens in all.
++num_heads,num_kv_heads,head_size,block_size,context_max,batch_max
++4,1,128,16,256,1
++4,1,128,16,256,2
++4,1,128,16,256,4
++4,1,128,16,256,8
++4,1,128,16,256,16
++4,1,128,16,256,32
++4,1,128,16,256,64
++4,1,128,16,256,128
++4,1,128,16,256,256
++4,1,128,16,512,1
++4,1,128,16,512,2
++4,1,128,16,512,4
++4,1,128,16,512,8
++4,1,128,16,512,16
++4,1,128,16,512,32
++4,1,128,16,512,64
++4,1,128,16,512,128
++4,1,128,16,512,256
++4,1,128,16,1024,1
++4,1,128,16,1024,2
++4,1,128,16,1024,4
++4,1,128,16,1024,8
++4,1,128,16,1024,16
++4,1,128,16,1024,32
++4,1,128,16,1024,64
++4,1,128,16,1024,128
++4,1,128,16,1024,256
++4,1,128,16,2048,1
++4,1,128,16,2048,2
++4,1,128,16,2048,4
++4,1,128,16,2048,8
++4,1,128,16,2048,16
++4,1,128,16,2048,32
++4,1,128,16,2048,64
++4,1,128,16,2048,128
++4,1,128,16,2048,256
++4,1,128,16,4096,1
++4,1,128,16,4096,2
++4,1,128,16,4096,4
++4,1,128,16,4096,8
++4,1,128,16,4096,16
++4,1,128,16,4096,32
++4,1,128,16,4096,64
++4,1,128,16,4096,128
++4,1,128,16,4096,256
++4,1,128,16,8192,1
++4,1,128,16,8192,2
++4,1,128,16,8192,4
++4,1,128,16,8192,8
++4,1,128,16,8192,16
++4,1,128,16,8192,32
++4,1,128,16,8192,64
++4,1,128,16,8192,128
++4,1,128,16,8192,256
++4,1,128,16,16384,1
++4,1,128,16,16384,2
++4,1,128,16,16384,4
++4,1,128,16,16384,8
++4,1,128,16,16384,16
++4,1,128,16,16384,32
++4,1,128,16,16384,64
++4,1,128,16,16384,128
++4,1,128,16,16384,256
++4,1,128,16,32768,1
++4,1,128,16,32768,2
++4,1,128,16,32768,4
++4,1,128,16,32768,8
++4,1,128,16,32768,16
++4,1,128,16,32768,32
++4,1,128,16,32768,64
++4,1,128,16,32768,128
++4,1,128,16,65536,1
++4,1,128,16,65536,2
++4,1,128,16,65536,4
++4,1,128,16,65536,8
++4,1,128,16,65536,16
++4,1,128,16,65536,32
++4,1,128,16,65536,64
++4,1,128,16,131072,1
++4,1,128,16,131072,2
++4,1,128,16,131072,4
++4,1,128,16,131072,8
++4,1,128,16,131072,16
++4,1,128,16,131072,32
++4,1,128,64,256,1
++4,1,128,64,256,2
++4,1,128,64,256,4
++4,1,128,64,256,8
++4,1,128,64,256,16
++4,1,128,64,256,32
++4,1,128,64,256,64
++4,1,128,64,256,128
++4,1,128,64,256,256
++4,1,128,64,512,1
++4,1,128,64,512,2
++4,1,128,64,512,4
++4,1,128,64,512,8
++4,1,128,64,512,16
++4,1,128,64,512,32
++4,1,128,64,512,64
++4,1,128,64,512,128
++4,1,128,64,512,256
++4,1,128,64,1024,1
++4,1,128,64,1024,2
++4,1,128,64,1024,4
++4,1,128,64,1024,8
++4,1,128,64,1024,16
++4,1,128,64,1024,32
++4,1,128,64,1024,64
++4,1,128,64,1024,128
++4,1,128,64,1024,256
++4,1,128,64,2048,1
++4,1,128,64,2048,2
++4,1,128,64,2048,4
++4,1,128,64,2048,8
++4,1,128,64,2048,16
++4,1,128,64,2048,32
++4,1,128,64,2048,64
++4,1,128,64,2048,128
++4,1,128,64,2048,256
++4,1,128,64,4096,1
++4,1,128,64,4096,2
++4,1,128,64,4096,4
++4,1,128,64,4096,8
++4,1,128,64,4096,16
++4,1,128,64,4096,32
++4,1,128,64,4096,64
++4,1,128,64,4096,128
++4,1,128,64,4096,256
++4,1,128,64,8192,1
++4,1,128,64,8192,2
++4,1,128,64,8192,4
++4,1,128,64,8192,8
++4,1,128,64,8192,16
++4,1,128,64,8192,32
++4,1,128,64,8192,64
++4,1,128,64,8192,128
++4,1,128,64,8192,256
++4,1,128,64,16384,1
++4,1,128,64,16384,2
++4,1,128,64,16384,4
++4,1,128,64,16384,8
++4,1,128,64,16384,16
++4,1,128,64,16384,32
++4,1,128,64,16384,64
++4,1,128,64,16384,128
++4,1,128,64,16384,256
++4,1,128,64,32768,1
++4,1,128,64,32768,2
++4,1,128,64,32768,4
++4,1,128,64,32768,8
++4,1,128,64,32768,16
++4,1,128,64,32768,32
++4,1,128,64,32768,64
++4,1,128,64,32768,128
++4,1,128,64,65536,1
++4,1,128,64,65536,2
++4,1,128,64,65536,4
++4,1,128,64,65536,8
++4,1,128,64,65536,16
++4,1,128,64,65536,32
++4,1,128,64,65536,64
++4,1,128,64,131072,1
++4,1,128,64,131072,2
++4,1,128,64,131072,4
++4,1,128,64,131072,8
++4,1,128,64,131072,16
++4,1,128,64,131072,32
++8,1,128,16,256,1
++8,1,128,16,256,2
++8,1,128,16,256,4
++8,1,128,16,256,8
++8,1,128,16,256,16
++8,1,128,16,256,32
++8,1,128,16,256,64
++8,1,128,16,256,128
++8,1,128,16,256,256
++8,1,128,16,512,1
++8,1,128,16,512,2
++8,1,128,16,512,4
++8,1,128,16,512,8
++8,1,128,16,512,16
++8,1,128,16,512,32
++8,1,128,16,512,64
++8,1,128,16,512,128
++8,1,128,16,512,256
++8,1,128,16,1024,1
++8,1,128,16,1024,2
++8,1,128,16,1024,4
++8,1,128,16,1024,8
++8,1,128,16,1024,16
++8,1,128,16,1024,32
++8,1,128,16,1024,64
++8,1,128,16,1024,128
++8,1,128,16,1024,256
++8,1,128,16,2048,1
++8,1,128,16,2048,2
++8,1,128,16,2048,4
++8,1,128,16,2048,8
++8,1,128,16,2048,16
++8,1,128,16,2048,32
++8,1,128,16,2048,64
++8,1,128,16,2048,128
++8,1,128,16,2048,256
++8,1,128,16,4096,1
++8,1,128,16,4096,2
++8,1,128,16,4096,4
++8,1,128,16,4096,8
++8,1,128,16,4096,16
++8,1,128,16,4096,32
++8,1,128,16,4096,64
++8,1,128,16,4096,128
++8,1,128,16,4096,256
++8,1,128,16,8192,1
++8,1,128,16,8192,2
++8,1,128,16,8192,4
++8,1,128,16,8192,8
++8,1,128,16,8192,16
++8,1,128,16,8192,32
++8,1,128,16,8192,64
++8,1,128,16,8192,128
++8,1,128,16,8192,256
++8,1,128,16,16384,1
++8,1,128,16,16384,2
++8,1,128,16,16384,4
++8,1,128,16,16384,8
++8,1,128,16,16384,16
++8,1,128,16,16384,32
++8,1,128,16,16384,64
++8,1,128,16,16384,128
++8,1,128,16,16384,256
++8,1,128,16,32768,1
++8,1,128,16,32768,2
++8,1,128,16,32768,4
++8,1,128,16,32768,8
++8,1,128,16,32768,16
++8,1,128,16,32768,32
++8,1,128,16,32768,64
++8,1,128,16,32768,128
++8,1,128,16,65536,1
++8,1,128,16,65536,2
++8,1,128,16,65536,4
++8,1,128,16,65536,8
++8,1,128,16,65536,16
++8,1,128,16,65536,32
++8,1,128,16,65536,64
++8,1,128,16,131072,1
++8,1,128,16,131072,2
++8,1,128,16,131072,4
++8,1,128,16,131072,8
++8,1,128,16,131072,16
++8,1,128,16,131072,32
++8,1,128,64,256,1
++8,1,128,64,256,2
++8,1,128,64,256,4
++8,1,128,64,256,8
++8,1,128,64,256,16
++8,1,128,64,256,32
++8,1,128,64,256,64
++8,1,128,64,256,128
++8,1,128,64,256,256
++8,1,128,64,512,1
++8,1,128,64,512,2
++8,1,128,64,512,4
++8,1,128,64,512,8
++8,1,128,64,512,16
++8,1,128,64,512,32
++8,1,128,64,512,64
++8,1,128,64,512,128
++8,1,128,64,512,256
++8,1,128,64,1024,1
++8,1,128,64,1024,2
++8,1,128,64,1024,4
++8,1,128,64,1024,8
++8,1,128,64,1024,16
++8,1,128,64,1024,32
++8,1,128,64,1024,64
++8,1,128,64,1024,128
++8,1,128,64,1024,256
++8,1,128,64,2048,1
++8,1,128,64,2048,2
++8,1,128,64,2048,4
++8,1,128,64,2048,8
++8,1,128,64,2048,16
++8,1,128,64,2048,32
++8,1,128,64,2048,64
++8,1,128,64,2048,128
++8,1,128,64,2048,256
++8,1,128,64,4096,1
++8,1,128,64,4096,2
++8,1,128,64,4096,4
++8,1,128,64,4096,8
++8,1,128,64,4096,16
++8,1,128,64,4096,32
++8,1,128,64,4096,64
++8,1,128,64,4096,128
++8,1,128,64,4096,256
++8,1,128,64,8192,1
++8,1,128,64,8192,2
++8,1,128,64,8192,4
++8,1,128,64,8192,8
++8,1,128,64,8192,16
++8,1,128,64,8192,32
++8,1,128,64,8192,64
++8,1,128,64,8192,128
++8,1,128,64,8192,256
++8,1,128,64,16384,1
++8,1,128,64,16384,2
++8,1,128,64,16384,4
++8,1,128,64,16384,8
++8,1,128,64,16384,16
++8,1,128,64,16384,32
++8,1,128,64,16384,64
++8,1,128,64,16384,128
++8,1,128,64,16384,256
++8,1,128,64,32768,1
++8,1,128,64,32768,2
++8,1,128,64,32768,4
++8,1,128,64,32768,8
++8,1,128,64,32768,16
++8,1,128,64,32768,32
++8,1,128,64,32768,64
++8,1,128,64,32768,128
++8,1,128,64,65536,1
++8,1,128,64,65536,2
++8,1,128,64,65536,4
++8,1,128,64,65536,8
++8,1,128,64,65536,16
++8,1,128,64,65536,32
++8,1,128,64,65536,64
++8,1,128,64,131072,1
++8,1,128,64,131072,2
++8,1,128,64,131072,4
++8,1,128,64,131072,8
++8,1,128,64,131072,16
++8,1,128,64,131072,32
++16,1,128,16,256,1
++16,1,128,16,256,2
++16,1,128,16,256,4
++16,1,128,16,256,8
++16,1,128,16,256,16
++16,1,128,16,256,32
++16,1,128,16,256,64
++16,1,128,16,256,128
++16,1,128,16,256,256
++16,1,128,16,512,1
++16,1,128,16,512,2
++16,1,128,16,512,4
++16,1,128,16,512,8
++16,1,128,16,512,16
++16,1,128,16,512,32
++16,1,128,16,512,64
++16,1,128,16,512,128
++16,1,128,16,512,256
++16,1,128,16,1024,1
++16,1,128,16,1024,2
++16,1,128,16,1024,4
++16,1,128,16,1024,8
++16,1,128,16,1024,16
++16,1,128,16,1024,32
++16,1,128,16,1024,64
++16,1,128,16,1024,128
++16,1,128,16,1024,256
++16,1,128,16,2048,1
++16,1,128,16,2048,2
++16,1,128,16,2048,4
++16,1,128,16,2048,8
++16,1,128,16,2048,16
++16,1,128,16,2048,32
++16,1,128,16,2048,64
++16,1,128,16,2048,128
++16,1,128,16,2048,256
++16,1,128,16,4096,1
++16,1,128,16,4096,2
++16,1,128,16,4096,4
++16,1,128,16,4096,8
++16,1,128,16,4096,16
++16,1,128,16,4096,32
++16,1,128,16,4096,64
++16,1,128,16,4096,128
++16,1,128,16,4096,256
++16,1,128,16,8192,1
++16,1,128,16,8192,2
++16,1,128,16,8192,4
++16,1,128,16,8192,8
++16,1,128,16,8192,16
++16,1,128,16,8192,32
++16,1,128,16,8192,64
++16,1,128,16,8192,128
++16,1,128,16,8192,256
++16,1,128,16,16384,1
++16,1,128,16,16384,2
++16,1,128,16,16384,4
++16,1,128,16,16384,8
++16,1,128,16,16384,16
++16,1,128,16,16384,32
++16,1,128,16,16384,64
++16,1,128,16,16384,128
++16,1,128,16,16384,256
++16,1,128,16,32768,1
++16,1,128,16,32768,2
++16,1,128,16,32768,4
++16,1,128,16,32768,8
++16,1,128,16,32768,16
++16,1,128,16,32768,32
++16,1,128,16,32768,64
++16,1,128,16,32768,128
++16,1,128,16,65536,1
++16,1,128,16,65536,2
++16,1,128,16,65536,4
++16,1,128,16,65536,8
++16,1,128,16,65536,16
++16,1,128,16,65536,32
++16,1,128,16,65536,64
++16,1,128,16,131072,1
++16,1,128,16,131072,2
++16,1,128,16,131072,4
++16,1,128,16,131072,8
++16,1,128,16,131072,16
++16,1,128,16,131072,32
++16,1,128,64,256,1
++16,1,128,64,256,2
++16,1,128,64,256,4
++16,1,128,64,256,8
++16,1,128,64,256,16
++16,1,128,64,256,32
++16,1,128,64,256,64
++16,1,128,64,256,128
++16,1,128,64,256,256
++16,1,128,64,512,1
++16,1,128,64,512,2
++16,1,128,64,512,4
++16,1,128,64,512,8
++16,1,128,64,512,16
++16,1,128,64,512,32
++16,1,128,64,512,64
++16,1,128,64,512,128
++16,1,128,64,512,256
++16,1,128,64,1024,1
++16,1,128,64,1024,2
++16,1,128,64,1024,4
++16,1,128,64,1024,8
++16,1,128,64,1024,16
++16,1,128,64,1024,32
++16,1,128,64,1024,64
++16,1,128,64,1024,128
++16,1,128,64,1024,256
++16,1,128,64,2048,1
++16,1,128,64,2048,2
++16,1,128,64,2048,4
++16,1,128,64,2048,8
++16,1,128,64,2048,16
++16,1,128,64,2048,32
++16,1,128,64,2048,64
++16,1,128,64,2048,128
++16,1,128,64,2048,256
++16,1,128,64,4096,1
++16,1,128,64,4096,2
++16,1,128,64,4096,4
++16,1,128,64,4096,8
++16,1,128,64,4096,16
++16,1,128,64,4096,32
++16,1,128,64,4096,64
++16,1,128,64,4096,128
++16,1,128,64,4096,256
++16,1,128,64,8192,1
++16,1,128,64,8192,2
++16,1,128,64,8192,4
++16,1,128,64,8192,8
++16,1,128,64,8192,16
++16,1,128,64,8192,32
++16,1,128,64,8192,64
++16,1,128,64,8192,128
++16,1,128,64,8192,256
++16,1,128,64,16384,1
++16,1,128,64,16384,2
++16,1,128,64,16384,4
++16,1,128,64,16384,8
++16,1,128,64,16384,16
++16,1,128,64,16384,32
++16,1,128,64,16384,64
++16,1,128,64,16384,128
++16,1,128,64,16384,256
++16,1,128,64,32768,1
++16,1,128,64,32768,2
++16,1,128,64,32768,4
++16,1,128,64,32768,8
++16,1,128,64,32768,16
++16,1,128,64,32768,32
++16,1,128,64,32768,64
++16,1,128,64,32768,128
++16,1,128,64,65536,1
++16,1,128,64,65536,2
++16,1,128,64,65536,4
++16,1,128,64,65536,8
++16,1,128,64,65536,16
++16,1,128,64,65536,32
++16,1,128,64,65536,64
++16,1,128,64,131072,1
++16,1,128,64,131072,2
++16,1,128,64,131072,4
++16,1,128,64,131072,8
++16,1,128,64,131072,16
++16,1,128,64,131072,32
++32,8,128,16,256,1
++32,8,128,16,256,2
++32,8,128,16,256,4
++32,8,128,16,256,8
++32,8,128,16,256,16
++32,8,128,16,256,32
++32,8,128,16,256,64
++32,8,128,16,256,128
++32,8,128,16,256,256
++32,8,128,16,512,1
++32,8,128,16,512,2
++32,8,128,16,512,4
++32,8,128,16,512,8
++32,8,128,16,512,16
++32,8,128,16,512,32
++32,8,128,16,512,64
++32,8,128,16,512,128
++32,8,128,16,512,256
++32,8,128,16,1024,1
++32,8,128,16,1024,2
++32,8,128,16,1024,4
++32,8,128,16,1024,8
++32,8,128,16,1024,16
++32,8,128,16,1024,32
++32,8,128,16,1024,64
++32,8,128,16,1024,128
++32,8,128,16,1024,256
++32,8,128,16,2048,1
++32,8,128,16,2048,2
++32,8,128,16,2048,4
++32,8,128,16,2048,8
++32,8,128,16,2048,16
++32,8,128,16,2048,32
++32,8,128,16,2048,64
++32,8,128,16,2048,128
++32,8,128,16,2048,256
++32,8,128,16,4096,1
++32,8,128,16,4096,2
++32,8,128,16,4096,4
++32,8,128,16,4096,8
++32,8,128,16,4096,16
++32,8,128,16,4096,32
++32,8,128,16,4096,64
++32,8,128,16,4096,128
++32,8,128,16,4096,256
++32,8,128,16,8192,1
++32,8,128,16,8192,2
++32,8,128,16,8192,4
++32,8,128,16,8192,8
++32,8,128,16,8192,16
++32,8,128,16,8192,32
++32,8,128,16,8192,64
++32,8,128,16,8192,128
++32,8,128,16,8192,256
++32,8,128,16,16384,1
++32,8,128,16,16384,2
++32,8,128,16,16384,4
++32,8,128,16,16384,8
++32,8,128,16,16384,16
++32,8,128,16,16384,32
++32,8,128,16,16384,64
++32,8,128,16,16384,128
++32,8,128,16,16384,256
++32,8,128,16,32768,1
++32,8,128,16,32768,2
++32,8,128,16,32768,4
++32,8,128,16,32768,8
++32,8,128,16,32768,16
++32,8,128,16,32768,32
++32,8,128,16,32768,64
++32,8,128,16,32768,128
++32,8,128,16,65536,1
++32,8,128,16,65536,2
++32,8,128,16,65536,4
++32,8,128,16,65536,8
++32,8,128,16,65536,16
++32,8,128,16,65536,32
++32,8,128,16,65536,64
++32,8,128,16,131072,1
++32,8,128,16,131072,2
++32,8,128,16,131072,4
++32,8,128,16,131072,8
++32,8,128,16,131072,16
++32,8,128,16,131072,32
++32,8,128,64,256,1
++32,8,128,64,256,2
++32,8,128,64,256,4
++32,8,128,64,256,8
++32,8,128,64,256,16
++32,8,128,64,256,32
++32,8,128,64,256,64
++32,8,128,64,256,128
++32,8,128,64,256,256
++32,8,128,64,512,1
++32,8,128,64,512,2
++32,8,128,64,512,4
++32,8,128,64,512,8
++32,8,128,64,512,16
++32,8,128,64,512,32
++32,8,128,64,512,64
++32,8,128,64,512,128
++32,8,128,64,512,256
++32,8,128,64,1024,1
++32,8,128,64,1024,2
++32,8,128,64,1024,4
++32,8,128,64,1024,8
++32,8,128,64,1024,16
++32,8,128,64,1024,32
++32,8,128,64,1024,64
++32,8,128,64,1024,128
++32,8,128,64,1024,256
++32,8,128,64,2048,1
++32,8,128,64,2048,2
++32,8,128,64,2048,4
++32,8,128,64,2048,8
++32,8,128,64,2048,16
++32,8,128,64,2048,32
++32,8,128,64,2048,64
++32,8,128,64,2048,128
++32,8,128,64,2048,256
++32,8,128,64,4096,1
++32,8,128,64,4096,2
++32,8,128,64,4096,4
++32,8,128,64,4096,8
++32,8,128,64,4096,16
++32,8,128,64,4096,32
++32,8,128,64,4096,64
++32,8,128,64,4096,128
++32,8,128,64,4096,256
++32,8,128,64,8192,1
++32,8,128,64,8192,2
++32,8,128,64,8192,4
++32,8,128,64,8192,8
++32,8,128,64,8192,16
++32,8,128,64,8192,32
++32,8,128,64,8192,64
++32,8,128,64,8192,128
++32,8,128,64,8192,256
++32,8,128,64,16384,1
++32,8,128,64,16384,2
++32,8,128,64,16384,4
++32,8,128,64,16384,8
++32,8,128,64,16384,16
++32,8,128,64,16384,32
++32,8,128,64,16384,64
++32,8,128,64,16384,128
++32,8,128,64,16384,256
++32,8,128,64,32768,1
++32,8,128,64,32768,2
++32,8,128,64,32768,4
++32,8,128,64,32768,8
++32,8,128,64,32768,16
++32,8,128,64,32768,32
++32,8,128,64,32768,64
++32,8,128,64,32768,128
++32,8,128,64,65536,1
++32,8,128,64,65536,2
++32,8,128,64,65536,4
++32,8,128,64,65536,8
++32,8,128,64,65536,16
++32,8,128,64,65536,32
++32,8,128,64,65536,64
++32,8,128,64,131072,1
++32,8,128,64,131072,2
++32,8,128,64,131072,4
++32,8,128,64,131072,8
++32,8,128,64,131072,16
++32,8,128,64,131072,32
++64,8,128,16,256,1
++64,8,128,16,256,2
++64,8,128,16,256,4
++64,8,128,16,256,8
++64,8,128,16,256,16
++64,8,128,16,256,32
++64,8,128,16,256,64
++64,8,128,16,256,128
++64,8,128,16,256,256
++64,8,128,16,512,1
++64,8,128,16,512,2
++64,8,128,16,512,4
++64,8,128,16,512,8
++64,8,128,16,512,16
++64,8,128,16,512,32
++64,8,128,16,512,64
++64,8,128,16,512,128
++64,8,128,16,512,256
++64,8,128,16,1024,1
++64,8,128,16,1024,2
++64,8,128,16,1024,4
++64,8,128,16,1024,8
++64,8,128,16,1024,16
++64,8,128,16,1024,32
++64,8,128,16,1024,64
++64,8,128,16,1024,128
++64,8,128,16,1024,256
++64,8,128,16,2048,1
++64,8,128,16,2048,2
++64,8,128,16,2048,4
++64,8,128,16,2048,8
++64,8,128,16,2048,16
++64,8,128,16,2048,32
++64,8,128,16,2048,64
++64,8,128,16,2048,128
++64,8,128,16,2048,256
++64,8,128,16,4096,1
++64,8,128,16,4096,2
++64,8,128,16,4096,4
++64,8,128,16,4096,8
++64,8,128,16,4096,16
++64,8,128,16,4096,32
++64,8,128,16,4096,64
++64,8,128,16,4096,128
++64,8,128,16,4096,256
++64,8,128,16,8192,1
++64,8,128,16,8192,2
++64,8,128,16,8192,4
++64,8,128,16,8192,8
++64,8,128,16,8192,16
++64,8,128,16,8192,32
++64,8,128,16,8192,64
++64,8,128,16,8192,128
++64,8,128,16,8192,256
++64,8,128,16,16384,1
++64,8,128,16,16384,2
++64,8,128,16,16384,4
++64,8,128,16,16384,8
++64,8,128,16,16384,16
++64,8,128,16,16384,32
++64,8,128,16,16384,64
++64,8,128,16,16384,128
++64,8,128,16,16384,256
++64,8,128,16,32768,1
++64,8,128,16,32768,2
++64,8,128,16,32768,4
++64,8,128,16,32768,8
++64,8,128,16,32768,16
++64,8,128,16,32768,32
++64,8,128,16,32768,64
++64,8,128,16,32768,128
++64,8,128,16,65536,1
++64,8,128,16,65536,2
++64,8,128,16,65536,4
++64,8,128,16,65536,8
++64,8,128,16,65536,16
++64,8,128,16,65536,32
++64,8,128,16,65536,64
++64,8,128,16,131072,1
++64,8,128,16,131072,2
++64,8,128,16,131072,4
++64,8,128,16,131072,8
++64,8,128,16,131072,16
++64,8,128,16,131072,32
++64,8,128,64,256,1
++64,8,128,64,256,2
++64,8,128,64,256,4
++64,8,128,64,256,8
++64,8,128,64,256,16
++64,8,128,64,256,32
++64,8,128,64,256,64
++64,8,128,64,256,128
++64,8,128,64,256,256
++64,8,128,64,512,1
++64,8,128,64,512,2
++64,8,128,64,512,4
++64,8,128,64,512,8
++64,8,128,64,512,16
++64,8,128,64,512,32
++64,8,128,64,512,64
++64,8,128,64,512,128
++64,8,128,64,512,256
++64,8,128,64,1024,1
++64,8,128,64,1024,2
++64,8,128,64,1024,4
++64,8,128,64,1024,8
++64,8,128,64,1024,16
++64,8,128,64,1024,32
++64,8,128,64,1024,64
++64,8,128,64,1024,128
++64,8,128,64,1024,256
++64,8,128,64,2048,1
++64,8,128,64,2048,2
++64,8,128,64,2048,4
++64,8,128,64,2048,8
++64,8,128,64,2048,16
++64,8,128,64,2048,32
++64,8,128,64,2048,64
++64,8,128,64,2048,128
++64,8,128,64,2048,256
++64,8,128,64,4096,1
++64,8,128,64,4096,2
++64,8,128,64,4096,4
++64,8,128,64,4096,8
++64,8,128,64,4096,16
++64,8,128,64,4096,32
++64,8,128,64,4096,64
++64,8,128,64,4096,128
++64,8,128,64,4096,256
++64,8,128,64,8192,1
++64,8,128,64,8192,2
++64,8,128,64,8192,4
++64,8,128,64,8192,8
++64,8,128,64,8192,16
++64,8,128,64,8192,32
++64,8,128,64,8192,64
++64,8,128,64,8192,128
++64,8,128,64,8192,256
++64,8,128,64,16384,1
++64,8,128,64,16384,2
++64,8,128,64,16384,4
++64,8,128,64,16384,8
++64,8,128,64,16384,16
++64,8,128,64,16384,32
++64,8,128,64,16384,64
++64,8,128,64,16384,128
++64,8,128,64,16384,256
++64,8,128,64,32768,1
++64,8,128,64,32768,2
++64,8,128,64,32768,4
++64,8,128,64,32768,8
++64,8,128,64,32768,16
++64,8,128,64,32768,32
++64,8,128,64,32768,64
++64,8,128,64,32768,128
++64,8,128,64,65536,1
++64,8,128,64,65536,2
++64,8,128,64,65536,4
++64,8,128,64,65536,8
++64,8,128,64,65536,16
++64,8,128,64,65536,32
++64,8,128,64,65536,64
++64,8,128,64,131072,1
++64,8,128,64,131072,2
++64,8,128,64,131072,4
++64,8,128,64,131072,8
++64,8,128,64,131072,16
++64,8,128,64,131072,32
++128,8,128,16,256,1
++128,8,128,16,256,2
++128,8,128,16,256,4
++128,8,128,16,256,8
++128,8,128,16,256,16
++128,8,128,16,256,32
++128,8,128,16,256,64
++128,8,128,16,256,128
++128,8,128,16,256,256
++128,8,128,16,512,1
++128,8,128,16,512,2
++128,8,128,16,512,4
++128,8,128,16,512,8
++128,8,128,16,512,16
++128,8,128,16,512,32
++128,8,128,16,512,64
++128,8,128,16,512,128
++128,8,128,16,512,256
++128,8,128,16,1024,1
++128,8,128,16,1024,2
++128,8,128,16,1024,4
++128,8,128,16,1024,8
++128,8,128,16,1024,16
++128,8,128,16,1024,32
++128,8,128,16,1024,64
++128,8,128,16,1024,128
++128,8,128,16,1024,256
++128,8,128,16,2048,1
++128,8,128,16,2048,2
++128,8,128,16,2048,4
++128,8,128,16,2048,8
++128,8,128,16,2048,16
++128,8,128,16,2048,32
++128,8,128,16,2048,64
++128,8,128,16,2048,128
++128,8,128,16,2048,256
++128,8,128,16,4096,1
++128,8,128,16,4096,2
++128,8,128,16,4096,4
++128,8,128,16,4096,8
++128,8,128,16,4096,16
++128,8,128,16,4096,32
++128,8,128,16,4096,64
++128,8,128,16,4096,128
++128,8,128,16,4096,256
++128,8,128,16,8192,1
++128,8,128,16,8192,2
++128,8,128,16,8192,4
++128,8,128,16,8192,8
++128,8,128,16,8192,16
++128,8,128,16,8192,32
++128,8,128,16,8192,64
++128,8,128,16,8192,128
++128,8,128,16,8192,256
++128,8,128,16,16384,1
++128,8,128,16,16384,2
++128,8,128,16,16384,4
++128,8,128,16,16384,8
++128,8,128,16,16384,16
++128,8,128,16,16384,32
++128,8,128,16,16384,64
++128,8,128,16,16384,128
++128,8,128,16,16384,256
++128,8,128,16,32768,1
++128,8,128,16,32768,2
++128,8,128,16,32768,4
++128,8,128,16,32768,8
++128,8,128,16,32768,16
++128,8,128,16,32768,32
++128,8,128,16,32768,64
++128,8,128,16,32768,128
++128,8,128,16,65536,1
++128,8,128,16,65536,2
++128,8,128,16,65536,4
++128,8,128,16,65536,8
++128,8,128,16,65536,16
++128,8,128,16,65536,32
++128,8,128,16,65536,64
++128,8,128,16,131072,1
++128,8,128,16,131072,2
++128,8,128,16,131072,4
++128,8,128,16,131072,8
++128,8,128,16,131072,16
++128,8,128,16,131072,32
++128,8,128,64,256,1
++128,8,128,64,256,2
++128,8,128,64,256,4
++128,8,128,64,256,8
++128,8,128,64,256,16
++128,8,128,64,256,32
++128,8,128,64,256,64
++128,8,128,64,256,128
++128,8,128,64,256,256
++128,8,128,64,512,1
++128,8,128,64,512,2
++128,8,128,64,512,4
++128,8,128,64,512,8
++128,8,128,64,512,16
++128,8,128,64,512,32
++128,8,128,64,512,64
++128,8,128,64,512,128
++128,8,128,64,512,256
++128,8,128,64,1024,1
++128,8,128,64,1024,2
++128,8,128,64,1024,4
++128,8,128,64,1024,8
++128,8,128,64,1024,16
++128,8,128,64,1024,32
++128,8,128,64,1024,64
++128,8,128,64,1024,128
++128,8,128,64,1024,256
++128,8,128,64,2048,1
++128,8,128,64,2048,2
++128,8,128,64,2048,4
++128,8,128,64,2048,8
++128,8,128,64,2048,16
++128,8,128,64,2048,32
++128,8,128,64,2048,64
++128,8,128,64,2048,128
++128,8,128,64,2048,256
++128,8,128,64,4096,1
++128,8,128,64,4096,2
++128,8,128,64,4096,4
++128,8,128,64,4096,8
++128,8,128,64,4096,16
++128,8,128,64,4096,32
++128,8,128,64,4096,64
++128,8,128,64,4096,128
++128,8,128,64,4096,256
++128,8,128,64,8192,1
++128,8,128,64,8192,2
++128,8,128,64,8192,4
++128,8,128,64,8192,8
++128,8,128,64,8192,16
++128,8,128,64,8192,32
++128,8,128,64,8192,64
++128,8,128,64,8192,128
++128,8,128,64,8192,256
++128,8,128,64,16384,1
++128,8,128,64,16384,2
++128,8,128,64,16384,4
++128,8,128,64,16384,8
++128,8,128,64,16384,16
++128,8,128,64,16384,32
++128,8,128,64,16384,64
++128,8,128,64,16384,128
++128,8,128,64,16384,256
++128,8,128,64,32768,1
++128,8,128,64,32768,2
++128,8,128,64,32768,4
++128,8,128,64,32768,8
++128,8,128,64,32768,16
++128,8,128,64,32768,32
++128,8,128,64,32768,64
++128,8,128,64,32768,128
++128,8,128,64,65536,1
++128,8,128,64,65536,2
++128,8,128,64,65536,4
++128,8,128,64,65536,8
++128,8,128,64,65536,16
++128,8,128,64,65536,32
++128,8,128,64,65536,64
++128,8,128,64,131072,1
++128,8,128,64,131072,2
++128,8,128,64,131072,4
++128,8,128,64,131072,8
++128,8,128,64,131072,16
++128,8,128,64,131072,32
+diff --git a/ci/scripts/mslk_test.bash b/ci/scripts/mslk_test.bash
+index f52024b..beeada3 100644
+--- a/ci/scripts/mslk_test.bash
++++ b/ci/scripts/mslk_test.bash
+@@ -160,6 +160,7 @@ __configure_mslk_test_rocm () {
+   export explicitly_enabled_tests=(
+     ./attention/fmha/flydsl_backward_gfx950_test.py
+     ./attention/flydsl/pa_decode_fp8_test.py
++    ./attention/dispatch_test.py
+   )
+ }
+ 
+diff --git a/mslk/attention/aiter/__init__.py b/mslk/attention/aiter/__init__.py
+new file mode 100644
+index 0000000..5a616a8
+--- /dev/null
++++ b/mslk/attention/aiter/__init__.py
+@@ -0,0 +1,13 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""aiter backends for MSLK attention ops on ROCm.
++
++Each module adapts one MSLK op to aiter's public op for the same computation:
++it takes the op's arguments and calls aiter. Which calls an op's aiter backend
++serves is decided by the op's dispatch module (``mslk/attention/dispatch/``).
++Importing these modules does not import aiter; see :mod:`mslk.aiter.common`.
++"""
+diff --git a/mslk/attention/aiter/paged_attention_decode_fp8.py b/mslk/attention/aiter/paged_attention_decode_fp8.py
+new file mode 100644
+index 0000000..34af06b
+--- /dev/null
++++ b/mslk/attention/aiter/paged_attention_decode_fp8.py
+@@ -0,0 +1,62 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""aiter backend of ``paged_attention_decode_fp8`` (FP8 paged KV cache, one
++query token per sequence) on gfx950.
++
++aiter's FlyDSL ``pa_decode`` takes the op's cache layout as is: K as
++[blocks, kv_heads, head_size / 16, block_size, 16], V transposed as
++[blocks, kv_heads, block_size / 16, head_size, 16], per-token FP32 scales as
++[blocks, kv_heads, block_size, 1]. It splits the work by the context lengths
++on the GPU (``plan_pa_decode``, no host sync), so a call is CUDA-graph safe.
++It uses its own scratch, so the op's ``max_context_partition_num``,
++``exp_sums``, ``max_logits`` and ``temporary_output`` are left unused.
++
++aiter's ASM ``pa_fwd_asm`` is not used: its softmax scale is fixed to
++1/sqrt(128), it takes only block size 16, and it was slower than both kernels.
++
++Which calls this backend serves is decided in
++``mslk/attention/dispatch/paged_attention_decode_fp8.py``.
++"""
++
++from typing import Optional
++
++import torch
++from mslk.aiter.common import import_aiter_module
++
++
++def paged_attention_decode_fp8(
++    output: torch.Tensor,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    context_lengths: torch.Tensor,
++    block_tables: torch.Tensor,
++    softmax_scale: float,
++    key_scale: torch.Tensor,
++    value_scale: torch.Tensor,
++    stream: Optional[torch.cuda.Stream] = None,
++) -> str:
++    """``paged_attention_decode_fp8`` computed by aiter's FlyDSL ``pa_decode``;
++    writes ``output``."""
++    pa_decode = import_aiter_module("aiter.ops.flydsl.pa_decode")
++    with torch.cuda.stream(stream or torch.cuda.current_stream(query.device)):
++        plan = pa_decode.plan_pa_decode(context_lengths, key_cache.shape[1])
++        pa_decode.pa_decode(
++            output,
++            query,
++            key_cache,
++            value_cache,
++            context_lengths,
++            block_tables,
++            softmax_scale,
++            1,  # query_length
++            compute_type=key_cache.dtype,
++            key_scale=key_scale,
++            value_scale=value_scale,
++            work_plan=plan,
++        )
++    return "aiter"
+diff --git a/mslk/attention/dispatch/__init__.py b/mslk/attention/dispatch/__init__.py
+new file mode 100644
+index 0000000..a8f6da1
+--- /dev/null
++++ b/mslk/attention/dispatch/__init__.py
+@@ -0,0 +1,14 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Which backend serves each attention op that has more than one, per call.
++
++One module per op: it lists the op's backends, decides which of them can take
++a call's arguments, and picks among those from the op's tuning table in
++``tables/`` (see :mod:`mslk.aiter.routing`). The op calls the module; the
++backends themselves live with their kind (``flydsl/``, ``aiter/``, ...).
++Importing these modules imports no backend.
++"""
+diff --git a/mslk/attention/dispatch/paged_attention_decode_fp8.py b/mslk/attention/dispatch/paged_attention_decode_fp8.py
+new file mode 100644
+index 0000000..f470da1
+--- /dev/null
++++ b/mslk/attention/dispatch/paged_attention_decode_fp8.py
+@@ -0,0 +1,144 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Which backend serves ``paged_attention_decode_fp8`` on gfx950.
++
++- ``mslk``: MSLK's FlyDSL kernel
++  (``mslk/attention/flydsl/decode/pa_decode_fp8.py``), the default and the
++  fallback.
++- ``aiter``: aiter's FlyDSL ``pa_decode``
++  (``mslk/attention/aiter/paged_attention_decode_fp8.py``), for the shapes
++  ``tables/paged_attention_decode_fp8.csv`` assigns to it. That table is written
++  by ``bench/aiter/tune_paged_attention_decode_fp8.py``.
++
++The table key is the heads, head size, block size and the context the block
++table can hold, rounded up to a power of two; the bucket is the batch size.
++All come from tensor shapes, never from the context lengths on the GPU, so a
++CUDA graph replays the backend it was captured with.
++"""
++
++from typing import Any, Optional, Sequence, Tuple
++
++import torch
++from mslk.aiter.routing import MSLK, OpRouting
++
++OP: str = "paged_attention_decode_fp8"
++AITER: str = "aiter"
++
++
++# Backends are imported on first use: importing this module must not pull in
++# FlyDSL or aiter.
++def _mslk(*args: Any, **kwargs: Any) -> str:
++    from mslk.attention.flydsl.decode.pa_decode_fp8_dispatch import (
++        paged_attention_decode_fp8_flydsl,
++    )
++
++    return paged_attention_decode_fp8_flydsl(*args, **kwargs)
++
++
++def _aiter(
++    output: torch.Tensor,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    context_lengths: torch.Tensor,
++    block_tables: torch.Tensor,
++    softmax_scale: float,
++    key_scale: torch.Tensor,
++    value_scale: torch.Tensor,
++    *,
++    stream: Optional[torch.cuda.Stream] = None,
++    **mslk_scratch: Any,
++) -> str:
++    from mslk.attention.aiter import paged_attention_decode_fp8 as aiter_op
++
++    return aiter_op.paged_attention_decode_fp8(
++        output,
++        query,
++        key_cache,
++        value_cache,
++        context_lengths,
++        block_tables,
++        softmax_scale,
++        key_scale,
++        value_scale,
++        stream,
++    )
++
++
++def _per_token_scales(key_scale: object, value_scale: object) -> bool:
++    # The table is tuned with per-token scales only.
++    return (
++        isinstance(key_scale, torch.Tensor)
++        and isinstance(value_scale, torch.Tensor)
++        and key_scale.dtype == value_scale.dtype == torch.float32
++        and key_scale.dim() == 4
++        and key_scale.shape == value_scale.shape
++        and key_scale.stride() == value_scale.stride()
++        and key_scale.stride(2) == 1
++    )
++
++
++def _aiter_accepts(
++    output: torch.Tensor,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    context_lengths: torch.Tensor,
++    block_tables: torch.Tensor,
++    softmax_scale: float,
++    key_scale: object,
++    value_scale: object,
++    *,
++    stream: object = None,
++    **mslk_scratch: Any,
++) -> bool:
++    head_size = query.shape[-1]
++    return (
++        (head_size == 64 or head_size % 128 == 0 and head_size <= 1024)
++        and output.dtype == query.dtype
++        and query.stride(-1) == 1
++        and output.stride(-1) == 1
++        and all(
++            t.is_contiguous()
++            for t in (key_cache, value_cache, context_lengths, block_tables)
++        )
++        and _per_token_scales(key_scale, value_scale)
++        and len(context_lengths) <= 4096
++        and (stream is None or isinstance(stream, torch.cuda.Stream))
++    )
++
++
++def _key(
++    output: torch.Tensor,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    context_lengths: torch.Tensor,
++    block_tables: torch.Tensor,
++    *args: object,
++    **kwargs: object,
++) -> Tuple[Sequence[object], int]:
++    block_size = key_cache.shape[-2]
++    capacity = block_tables.shape[1] * block_size
++    context_max = max(256, 1 << (capacity - 1).bit_length())
++    num_heads, head_size = query.shape[1:]
++    key = (num_heads, key_cache.shape[1], head_size, block_size, context_max)
++    return key, context_lengths.shape[0]
++
++
++#: ``paged_attention_decode_fp8`` on gfx950: call it with the op's arguments.
++ROUTING: OpRouting = OpRouting(
++    OP,
++    "mslk.attention.dispatch",
++    "tables/paged_attention_decode_fp8.csv",
++    key_columns=("num_heads", "num_kv_heads", "head_size", "block_size", "context_max"),
++    bucket_column="batch_max",
++    backends={MSLK: _mslk, AITER: _aiter},
++    key=_key,
++    accepts={AITER: _aiter_accepts},
++)
++BACKENDS: Tuple[str, ...] = tuple(ROUTING.backends)
+diff --git a/mslk/attention/dispatch/tables/paged_attention_decode_fp8.csv b/mslk/attention/dispatch/tables/paged_attention_decode_fp8.csv
+new file mode 100644
+index 0000000..34f8fa1
+--- /dev/null
++++ b/mslk/attention/dispatch/tables/paged_attention_decode_fp8.csv
+@@ -0,0 +1,1009 @@
++gfx,cu_num,num_heads,num_kv_heads,head_size,block_size,context_max,batch_max,backend,us,err_ratio,max_abs_err,tflops,bw,mslk_us,aiter_us
++gfx950,256,4,1,128,16,256,1,mslk,7.09,0,0.09849,0.07,9.53,7.09,11.69
++gfx950,256,4,1,128,16,256,2,mslk,7.24,0,0.1323,0.13,16.32,7.24,12.56
++gfx950,256,4,1,128,16,256,4,mslk,7.41,0,0.1289,0.23,29.63,7.41,12.60
++gfx950,256,4,1,128,16,256,8,mslk,7.51,0,0.1295,0.44,56.25,7.51,12.47
++gfx950,256,4,1,128,16,256,16,mslk,7.84,0,0.2353,0.82,105.55,7.84,12.24
++gfx950,256,4,1,128,16,256,32,mslk,8.00,0,0.1911,1.59,204.80,8.00,12.46
++gfx950,256,4,1,128,16,256,64,mslk,8.45,0,0.1519,2.99,386.01,8.45,12.59
++gfx950,256,4,1,128,16,256,128,mslk,10.01,0,0.2024,5.04,649.85,10.01,15.18
++gfx950,256,4,1,128,16,256,256,mslk,13.21,0,0.2012,7.64,985.07,13.21,15.86
++gfx950,256,4,1,128,16,512,1,mslk,7.31,0,0.09585,0.14,18.50,7.31,12.05
++gfx950,256,4,1,128,16,512,2,mslk,7.44,0,0.1253,0.25,31.81,7.44,12.99
++gfx950,256,4,1,128,16,512,4,mslk,7.62,0,0.1329,0.45,57.66,7.62,13.14
++gfx950,256,4,1,128,16,512,8,mslk,7.87,0,0.1487,0.83,107.40,7.87,13.36
++gfx950,256,4,1,128,16,512,16,mslk,7.95,0,0.2193,1.62,208.35,7.95,12.41
++gfx950,256,4,1,128,16,512,32,mslk,8.00,0,0.1503,3.18,409.51,8.00,12.55
++gfx950,256,4,1,128,16,512,64,mslk,9.88,0,0.1712,5.12,660.41,9.88,14.77
++gfx950,256,4,1,128,16,512,128,mslk,10.89,0,0.1693,9.27,1194.87,10.89,15.80
++gfx950,256,4,1,128,16,512,256,mslk,15.80,0,0.1887,12.76,1644.28,15.80,17.71
++gfx950,256,4,1,128,16,1024,1,mslk,7.44,0,0.1085,0.28,36.34,7.44,12.94
++gfx950,256,4,1,128,16,1024,2,mslk,7.69,0,0.1048,0.48,61.53,7.69,13.61
++gfx950,256,4,1,128,16,1024,4,mslk,7.75,0,0.1299,0.88,113.43,7.75,14.13
++gfx950,256,4,1,128,16,1024,8,mslk,7.89,0,0.159,1.66,214.14,7.89,14.19
++gfx950,256,4,1,128,16,1024,16,mslk,8.00,0,0.1421,3.21,414.10,8.00,12.47
++gfx950,256,4,1,128,16,1024,32,mslk,9.51,0,0.1692,5.35,689.61,9.51,14.82
++gfx950,256,4,1,128,16,1024,64,mslk,10.55,0,0.1827,9.59,1236.67,10.55,15.47
++gfx950,256,4,1,128,16,1024,128,mslk,13.19,0,0.2112,15.31,1973.13,13.19,17.42
++gfx950,256,4,1,128,16,1024,256,mslk,24.33,0,0.1717,16.57,2136.29,24.33,28.70
++gfx950,256,4,1,128,16,2048,1,mslk,7.56,0,0.11,0.56,71.56,7.56,13.96
++gfx950,256,4,1,128,16,2048,2,mslk,7.78,0,0.1085,0.94,121.63,7.78,14.91
++gfx950,256,4,1,128,16,2048,4,mslk,7.83,0,0.1509,1.74,224.29,7.83,15.00
++gfx950,256,4,1,128,16,2048,8,mslk,8.14,0,0.1535,3.22,414.97,8.14,14.92
++gfx950,256,4,1,128,16,2048,16,mslk,9.51,0,0.1537,5.40,696.53,9.51,15.01
++gfx950,256,4,1,128,16,2048,32,mslk,10.18,0,0.1882,9.99,1287.58,10.18,15.73
++gfx950,256,4,1,128,16,2048,64,mslk,12.84,0,0.175,15.76,2031.43,12.84,17.53
++gfx950,256,4,1,128,16,2048,128,mslk,23.08,0,0.1589,17.49,2255.20,23.08,24.35
++gfx950,256,4,1,128,16,2048,256,mslk,38.52,0,0.1933,20.93,2698.34,38.52,45.34
++gfx950,256,4,1,128,16,4096,1,mslk,10.08,0,0.09286,0.83,107.32,10.08,16.10
++gfx950,256,4,1,128,16,4096,2,mslk,10.12,0,0.1141,1.45,187.06,10.12,16.41
++gfx950,256,4,1,128,16,4096,4,mslk,10.15,0,0.1209,2.69,346.37,10.15,16.37
++gfx950,256,4,1,128,16,4096,8,mslk,12.56,0,0.1537,4.17,537.99,12.56,19.09
++gfx950,256,4,1,128,16,4096,16,mslk,12.96,0,0.1284,7.93,1022.26,12.96,16.45
++gfx950,256,4,1,128,16,4096,32,mslk,14.27,0,0.1919,14.25,1837.42,14.27,18.27
++gfx950,256,4,1,128,16,4096,64,mslk,19.07,0,0.1601,21.22,2735.58,19.07,24.97
++gfx950,256,4,1,128,16,4096,128,mslk,33.60,0,0.1704,24.03,3097.69,33.60,37.36
++gfx950,256,4,1,128,16,4096,256,mslk,59.24,0,0.1833,27.22,3509.25,59.24,77.34
++gfx950,256,4,1,128,16,8192,1,mslk,14.72,0,0.1083,1.14,146.96,14.72,19.71
++gfx950,256,4,1,128,16,8192,2,mslk,14.54,0,0.1299,2.02,260.25,14.54,19.77
++gfx950,256,4,1,128,16,8192,4,mslk,18.69,0,0.1579,2.92,376.13,18.69,22.09
++gfx950,256,4,1,128,16,8192,8,mslk,19.10,0,0.1318,5.49,707.71,19.10,22.69
++gfx950,256,4,1,128,16,8192,16,aiter,18.32,0,0.1476,11.22,1446.00,19.88,18.32
++gfx950,256,4,1,128,16,8192,32,mslk,22.54,0,0.1543,18.05,2326.31,22.54,24.70
++gfx950,256,4,1,128,16,8192,64,mslk,29.95,0,0.1782,27.02,3483.63,29.95,37.67
++gfx950,256,4,1,128,16,8192,128,mslk,57.64,0,0.1604,28.01,3611.20,57.64,61.15
++gfx950,256,4,1,128,16,8192,256,mslk,95.37,0,0.1766,33.82,4359.43,95.37,139.98
++gfx950,256,4,1,128,16,16384,1,aiter,20.51,0,0.1092,1.64,210.84,27.69,20.51
++gfx950,256,4,1,128,16,16384,2,aiter,22.63,0,0.121,2.59,334.51,30.72,22.63
++gfx950,256,4,1,128,16,16384,4,aiter,23.10,0,0.1187,4.72,608.54,30.97,23.10
++gfx950,256,4,1,128,16,16384,8,aiter,25.49,0,0.1358,8.23,1060.66,31.95,25.49
++gfx950,256,4,1,128,16,16384,16,aiter,26.55,0,0.131,15.48,1996.00,33.27,26.55
++gfx950,256,4,1,128,16,16384,32,mslk,38.29,0,0.1504,21.25,2739.70,38.29,37.44
++gfx950,256,4,1,128,16,16384,64,mslk,52.89,0,0.177,30.61,3945.54,52.89,57.83
++gfx950,256,4,1,128,16,16384,128,mslk,93.80,0,0.1606,34.43,4438.52,93.80,114.45
++gfx950,256,4,1,128,16,16384,256,mslk,183.94,0,0.1905,35.07,4520.67,183.94,288.41
++gfx950,256,4,1,128,16,32768,1,aiter,22.61,0,0.1331,2.97,382.62,56.44,22.61
++gfx950,256,4,1,128,16,32768,2,aiter,23.25,0,0.09919,5.05,651.13,55.70,23.25
++gfx950,256,4,1,128,16,32768,4,aiter,25.86,0,0.1379,8.43,1087.31,55.85,25.86
++gfx950,256,4,1,128,16,32768,8,aiter,32.31,0,0.1562,12.98,1673.33,56.67,32.31
++gfx950,256,4,1,128,16,32768,16,aiter,39.22,0,0.1638,20.96,2702.28,59.84,39.22
++gfx950,256,4,1,128,16,32768,32,aiter,57.82,0,0.1439,28.14,3627.95,68.42,57.82
++gfx950,256,4,1,128,16,32768,64,mslk,94.81,0,0.1873,34.15,4402.35,94.81,107.24
++gfx950,256,4,1,128,16,32768,128,mslk,188.84,0,0.1604,34.20,4409.20,188.84,215.19
++gfx950,256,4,1,128,16,65536,1,aiter,24.23,0,0.1346,5.54,714.17,106.64,24.23
++gfx950,256,4,1,128,16,65536,2,aiter,26.30,0,0.1267,8.93,1151.37,105.25,26.30
++gfx950,256,4,1,128,16,65536,4,aiter,33.40,0,0.1348,13.06,1683.60,105.82,33.40
++gfx950,256,4,1,128,16,65536,8,aiter,45.07,0,0.1328,18.61,2399.24,106.91,45.07
++gfx950,256,4,1,128,16,65536,16,aiter,62.04,0,0.1543,26.50,3416.15,110.65,62.04
++gfx950,256,4,1,128,16,65536,32,aiter,100.21,0,0.1716,32.48,4186.94,128.13,100.21
++gfx950,256,4,1,128,16,65536,64,mslk,187.91,0,0.1703,34.46,4442.58,187.91,208.69
++gfx950,256,4,1,128,16,131072,1,aiter,30.01,0,0.106,8.94,1153.04,208.18,30.01
++gfx950,256,4,1,128,16,131072,2,aiter,33.98,0,0.1186,13.82,1782.09,204.93,33.98
++gfx950,256,4,1,128,16,131072,4,aiter,45.99,0,0.1483,18.97,2445.18,204.53,45.99
++gfx950,256,4,1,128,16,131072,8,aiter,66.53,0,0.1589,25.22,3250.45,206.06,66.53
++gfx950,256,4,1,128,16,131072,16,aiter,102.71,0,0.1433,32.02,4127.04,213.72,102.71
++gfx950,256,4,1,128,16,131072,32,aiter,198.65,0,0.1836,32.77,4224.12,247.53,198.65
++gfx950,256,4,1,128,64,256,1,mslk,6.96,0,0.09748,0.08,9.71,6.96,10.96
++gfx950,256,4,1,128,64,256,2,mslk,7.19,0,0.0936,0.13,16.45,7.19,11.93
++gfx950,256,4,1,128,64,256,4,mslk,7.31,0,0.1252,0.23,30.06,7.31,12.05
++gfx950,256,4,1,128,64,256,8,mslk,7.53,0,0.1443,0.44,56.08,7.53,11.93
++gfx950,256,4,1,128,64,256,16,mslk,7.77,0,0.1293,0.83,106.48,7.77,11.58
++gfx950,256,4,1,128,64,256,32,mslk,7.84,0,0.1617,1.62,208.95,7.84,11.71
++gfx950,256,4,1,128,64,256,64,mslk,8.71,0,0.1825,2.90,374.33,8.71,12.31
++gfx950,256,4,1,128,64,256,128,mslk,9.60,0,0.1805,5.26,677.85,9.60,14.09
++gfx950,256,4,1,128,64,256,256,mslk,10.95,0,0.1969,9.22,1188.38,10.95,14.89
++gfx950,256,4,1,128,64,512,1,mslk,7.20,0,0.09095,0.15,18.76,7.20,11.70
++gfx950,256,4,1,128,64,512,2,mslk,7.25,0,0.1174,0.25,32.64,7.25,12.32
++gfx950,256,4,1,128,64,512,4,mslk,7.43,0,0.1249,0.46,59.11,7.43,12.27
++gfx950,256,4,1,128,64,512,8,mslk,7.66,0,0.2168,0.86,110.29,7.66,12.89
++gfx950,256,4,1,128,64,512,16,mslk,7.80,0,0.1493,1.65,212.31,7.80,11.64
++gfx950,256,4,1,128,64,512,32,mslk,7.93,0,0.1485,3.20,413.12,7.93,11.84
++gfx950,256,4,1,128,64,512,64,mslk,9.72,0,0.1684,5.21,671.11,9.72,13.81
++gfx950,256,4,1,128,64,512,128,mslk,10.33,0,0.2037,9.77,1259.52,10.33,14.66
++gfx950,256,4,1,128,64,512,256,mslk,13.36,0,0.1909,15.09,1945.73,13.36,16.96
++gfx950,256,4,1,128,64,1024,1,mslk,7.24,0,0.1267,0.29,37.33,7.24,12.35
++gfx950,256,4,1,128,64,1024,2,mslk,7.52,0,0.1404,0.49,62.88,7.52,12.75
++gfx950,256,4,1,128,64,1024,4,mslk,7.57,0,0.1433,0.90,116.03,7.57,13.43
++gfx950,256,4,1,128,64,1024,8,mslk,7.70,0,0.1624,1.70,219.40,7.70,13.46
++gfx950,256,4,1,128,64,1024,16,mslk,7.80,0,0.1367,3.29,424.53,7.80,11.68
++gfx950,256,4,1,128,64,1024,32,mslk,9.33,0,0.1562,5.45,702.65,9.33,13.70
++gfx950,256,4,1,128,64,1024,64,mslk,10.42,0,0.1663,9.71,1251.65,10.42,14.43
++gfx950,256,4,1,128,64,1024,128,mslk,12.53,0,0.1695,16.11,2077.15,12.53,16.59
++gfx950,256,4,1,128,64,1024,256,mslk,22.80,0,0.1791,17.68,2279.33,22.80,25.92
++gfx950,256,4,1,128,64,2048,1,mslk,7.40,0,0.1153,0.57,73.08,7.40,13.10
++gfx950,256,4,1,128,64,2048,2,mslk,7.63,0,0.111,0.96,123.94,7.63,14.16
++gfx950,256,4,1,128,64,2048,4,mslk,7.67,0,0.1264,1.78,229.08,7.67,14.10
++gfx950,256,4,1,128,64,2048,8,mslk,7.81,0,0.1662,3.36,432.73,7.81,14.55
++gfx950,256,4,1,128,64,2048,16,mslk,9.35,0,0.1351,5.50,708.74,9.35,13.86
++gfx950,256,4,1,128,64,2048,32,mslk,9.99,0,0.1387,10.18,1312.68,9.99,14.51
++gfx950,256,4,1,128,64,2048,64,mslk,12.59,0,0.1642,16.07,2071.50,12.59,16.63
++gfx950,256,4,1,128,64,2048,128,mslk,18.10,0,0.2125,22.31,2875.29,18.10,22.93
++gfx950,256,4,1,128,64,2048,256,mslk,33.08,0,0.2066,24.37,3141.97,33.08,40.47
++gfx950,256,4,1,128,64,4096,1,mslk,9.49,0,0.1034,0.88,113.92,9.49,15.42
++gfx950,256,4,1,128,64,4096,2,mslk,9.53,0,0.1238,1.54,198.58,9.53,15.67
++gfx950,256,4,1,128,64,4096,4,mslk,9.58,0,0.1181,2.85,367.01,9.58,15.81
++gfx950,256,4,1,128,64,4096,8,mslk,11.74,0,0.1664,4.47,575.85,11.74,17.49
++gfx950,256,4,1,128,64,4096,16,mslk,12.20,0,0.1328,8.42,1085.60,12.20,15.36
++gfx950,256,4,1,128,64,4096,32,mslk,13.48,0,0.1465,15.09,1945.75,13.48,17.27
++gfx950,256,4,1,128,64,4096,64,mslk,17.90,0,0.202,22.61,2914.35,17.90,23.53
++gfx950,256,4,1,128,64,4096,128,mslk,29.15,0,0.1628,27.69,3569.90,29.15,34.42
++gfx950,256,4,1,128,64,4096,256,mslk,53.54,0,0.2507,30.12,3882.57,53.54,66.97
++gfx950,256,4,1,128,64,8192,1,mslk,13.31,0,0.1291,1.26,162.47,13.31,18.90
++gfx950,256,4,1,128,64,8192,2,mslk,13.20,0,0.1187,2.22,286.68,13.20,19.09
++gfx950,256,4,1,128,64,8192,4,mslk,16.54,0,0.1336,3.30,424.98,16.54,20.87
++gfx950,256,4,1,128,64,8192,8,mslk,16.94,0,0.1274,6.19,797.78,16.94,21.61
++gfx950,256,4,1,128,64,8192,16,mslk,17.85,0,0.1447,11.51,1484.01,17.85,17.36
++gfx950,256,4,1,128,64,8192,32,mslk,20.73,0,0.1629,19.63,2529.90,20.73,23.83
++gfx950,256,4,1,128,64,8192,64,mslk,29.04,0,0.172,27.88,3593.39,29.04,34.64
++gfx950,256,4,1,128,64,8192,128,mslk,52.80,0,0.2046,30.58,3942.08,52.80,54.59
++gfx950,256,4,1,128,64,8192,256,mslk,88.15,0,0.1676,36.59,4716.63,88.15,118.88
++gfx950,256,4,1,128,64,16384,1,aiter,19.90,0,0.1163,1.69,217.34,25.23,19.90
++gfx950,256,4,1,128,64,16384,2,aiter,21.42,0,0.1184,2.74,353.43,26.28,21.42
++gfx950,256,4,1,128,64,16384,4,aiter,22.19,0,0.1543,4.91,633.48,26.57,22.19
++gfx950,256,4,1,128,64,16384,8,aiter,24.51,0,0.1463,8.56,1103.03,27.47,24.51
++gfx950,256,4,1,128,64,16384,16,aiter,25.07,0,0.1661,16.40,2113.46,28.71,25.07
++gfx950,256,4,1,128,64,16384,32,mslk,34.37,0,0.1558,23.68,3052.20,34.37,34.77
++gfx950,256,4,1,128,64,16384,64,mslk,51.90,0,0.1874,31.20,4021.47,51.90,52.50
++gfx950,256,4,1,128,64,16384,128,mslk,91.53,0,0.1769,35.28,4548.19,91.53,98.68
++gfx950,256,4,1,128,64,16384,256,mslk,178.53,0,0.1855,36.13,4657.81,178.53,234.75
++gfx950,256,4,1,128,64,32768,1,aiter,21.42,0,0.09762,3.13,403.92,47.00,21.42
++gfx950,256,4,1,128,64,32768,2,aiter,22.39,0,0.1164,5.25,676.29,46.45,22.39
++gfx950,256,4,1,128,64,32768,4,aiter,24.98,0,0.1301,8.73,1125.53,46.90,24.98
++gfx950,256,4,1,128,64,32768,8,aiter,30.68,0,0.1553,13.67,1762.37,47.60,30.68
++gfx950,256,4,1,128,64,32768,16,aiter,36.83,0,0.1683,22.32,2877.17,50.66,36.83
++gfx950,256,4,1,128,64,32768,32,aiter,52.56,0,0.1535,30.96,3991.05,61.62,52.56
++gfx950,256,4,1,128,64,32768,64,mslk,91.08,0,0.1523,35.55,4583.00,91.08,96.49
++gfx950,256,4,1,128,64,32768,128,mslk,183.78,0,0.1851,35.15,4530.73,183.78,184.70
++gfx950,256,4,1,128,64,65536,1,aiter,23.17,0,0.1105,5.79,746.84,87.86,23.17
++gfx950,256,4,1,128,64,65536,2,aiter,25.53,0,0.125,9.20,1185.97,86.43,25.53
++gfx950,256,4,1,128,64,65536,4,aiter,31.46,0,0.1248,13.87,1787.31,86.85,31.46
++gfx950,256,4,1,128,64,65536,8,aiter,42.28,0,0.1359,19.84,2557.77,88.49,42.28
++gfx950,256,4,1,128,64,65536,16,aiter,57.29,0,0.1437,28.70,3699.45,92.47,57.29
++gfx950,256,4,1,128,64,65536,32,aiter,88.25,0,0.1577,36.88,4754.01,113.44,88.25
++gfx950,256,4,1,128,64,65536,64,mslk,180.73,0,0.1543,35.83,4618.99,180.73,182.99
++gfx950,256,4,1,128,64,131072,1,aiter,27.49,0,0.1159,9.77,1258.97,168.48,27.49
++gfx950,256,4,1,128,64,131072,2,aiter,31.67,0,0.1474,14.83,1912.26,165.84,31.67
++gfx950,256,4,1,128,64,131072,4,aiter,43.20,0,0.1422,20.20,2603.29,168.04,43.20
++gfx950,256,4,1,128,64,131072,8,aiter,61.81,0,0.1464,27.14,3499.03,170.78,61.81
++gfx950,256,4,1,128,64,131072,16,aiter,91.63,0,0.1681,35.89,4626.26,176.78,91.63
++gfx950,256,4,1,128,64,131072,32,aiter,172.27,0,0.1612,37.79,4870.94,205.54,172.27
++gfx950,256,8,1,128,16,256,1,mslk,7.35,0,0.1037,0.14,9.20,7.35,10.86
++gfx950,256,8,1,128,16,256,2,mslk,7.65,0,0.1189,0.24,15.46,7.65,11.45
++gfx950,256,8,1,128,16,256,4,mslk,7.73,0,0.1443,0.44,28.41,7.73,11.51
++gfx950,256,8,1,128,16,256,8,mslk,7.89,0,0.1287,0.83,53.50,7.89,11.46
++gfx950,256,8,1,128,16,256,16,mslk,8.20,0,0.1512,1.57,101.02,8.20,11.17
++gfx950,256,8,1,128,16,256,32,mslk,8.42,0,0.1685,3.02,194.56,8.42,11.33
++gfx950,256,8,1,128,16,256,64,mslk,9.25,0,0.2083,5.47,352.36,9.25,11.76
++gfx950,256,8,1,128,16,256,128,mslk,10.42,0,0.196,9.68,624.21,10.42,13.37
++gfx950,256,8,1,128,16,256,256,mslk,14.11,0,0.222,14.30,921.88,14.11,14.03
++gfx950,256,8,1,128,16,512,1,mslk,7.58,0,0.1049,0.28,17.84,7.58,11.38
++gfx950,256,8,1,128,16,512,2,mslk,7.75,0,0.1186,0.47,30.52,7.75,11.82
++gfx950,256,8,1,128,16,512,4,mslk,7.92,0,0.1583,0.86,55.47,7.92,12.02
++gfx950,256,8,1,128,16,512,8,mslk,8.09,0,0.1368,1.62,104.38,8.09,12.37
++gfx950,256,8,1,128,16,512,16,mslk,8.25,0,0.1653,3.11,200.74,8.25,11.13
++gfx950,256,8,1,128,16,512,32,mslk,8.55,0,0.1849,5.95,383.42,8.55,11.29
++gfx950,256,8,1,128,16,512,64,mslk,10.17,0,0.1875,9.95,641.53,10.17,12.98
++gfx950,256,8,1,128,16,512,128,mslk,11.36,0,0.1975,17.77,1145.50,11.36,13.73
++gfx950,256,8,1,128,16,512,256,aiter,16.32,0,0.2619,24.70,1592.15,16.94,16.32
++gfx950,256,8,1,128,16,1024,1,mslk,7.73,0,0.1152,0.54,34.96,7.73,11.97
++gfx950,256,8,1,128,16,1024,2,mslk,7.91,0,0.1481,0.93,59.80,7.91,12.49
++gfx950,256,8,1,128,16,1024,4,mslk,8.01,0,0.1774,1.70,109.72,8.01,12.89
++gfx950,256,8,1,128,16,1024,8,mslk,8.26,0,0.1371,3.18,204.64,8.26,12.92
++gfx950,256,8,1,128,16,1024,16,mslk,8.24,0,0.2006,6.24,401.98,8.24,11.31
++gfx950,256,8,1,128,16,1024,32,mslk,9.77,0,0.173,10.41,671.21,9.77,12.80
++gfx950,256,8,1,128,16,1024,64,mslk,10.84,0,0.1582,18.66,1202.92,10.84,13.55
++gfx950,256,8,1,128,16,1024,128,mslk,13.69,0,0.2195,29.48,1899.99,13.69,15.94
++gfx950,256,8,1,128,16,1024,256,mslk,25.20,0,0.1986,32.00,2062.52,25.20,25.08
++gfx950,256,8,1,128,16,2048,1,mslk,7.86,0,0.1304,1.07,68.83,7.86,13.01
++gfx950,256,8,1,128,16,2048,2,mslk,8.04,0,0.1209,1.82,117.62,8.04,13.38
++gfx950,256,8,1,128,16,2048,4,mslk,8.07,0,0.1543,3.38,217.78,8.07,13.54
++gfx950,256,8,1,128,16,2048,8,mslk,8.25,0,0.1526,6.35,409.47,8.25,13.65
++gfx950,256,8,1,128,16,2048,16,mslk,9.76,0,0.2023,10.53,678.87,9.76,12.97
++gfx950,256,8,1,128,16,2048,32,mslk,10.46,0,0.1618,19.45,1253.54,10.46,13.64
++gfx950,256,8,1,128,16,2048,64,mslk,13.16,0,0.1704,30.75,1981.76,13.16,15.84
++gfx950,256,8,1,128,16,2048,128,aiter,22.32,0,0.1997,36.17,2331.15,23.56,22.32
++gfx950,256,8,1,128,16,2048,256,mslk,39.68,0,0.1705,40.65,2619.74,39.68,39.54
++gfx950,256,8,1,128,16,4096,1,mslk,10.32,0,0.1326,1.63,104.76,10.32,15.06
++gfx950,256,8,1,128,16,4096,2,mslk,10.37,0,0.1431,2.83,182.52,10.37,15.46
++gfx950,256,8,1,128,16,4096,4,mslk,10.60,0,0.154,5.14,331.43,10.60,15.42
++gfx950,256,8,1,128,16,4096,8,mslk,12.84,0,0.147,8.17,526.33,12.84,16.74
++gfx950,256,8,1,128,16,4096,16,mslk,13.20,0,0.1982,15.57,1003.43,13.20,14.48
++gfx950,256,8,1,128,16,4096,32,mslk,14.62,0,0.163,27.84,1794.19,14.62,16.75
++gfx950,256,8,1,128,16,4096,64,mslk,19.47,0,0.1657,41.57,2679.45,19.47,22.92
++gfx950,256,8,1,128,16,4096,128,mslk,34.34,0,0.1706,47.03,3031.20,34.34,34.21
++gfx950,256,8,1,128,16,4096,256,mslk,59.93,0,0.1998,53.82,3468.88,59.93,66.83
++gfx950,256,8,1,128,16,8192,1,mslk,15.01,0,0.1112,2.24,144.13,15.01,18.99
++gfx950,256,8,1,128,16,8192,2,mslk,15.31,0,0.1486,3.84,247.24,15.31,18.84
++gfx950,256,8,1,128,16,8192,4,mslk,18.89,0,0.1272,5.77,371.99,18.89,19.99
++gfx950,256,8,1,128,16,8192,8,mslk,19.35,0,0.1415,10.84,698.39,19.35,20.75
++gfx950,256,8,1,128,16,8192,16,aiter,16.62,0,0.1631,24.73,1594.10,20.13,16.62
++gfx950,256,8,1,128,16,8192,32,mslk,22.90,0,0.1642,35.53,2290.21,22.90,22.56
++gfx950,256,8,1,128,16,8192,64,mslk,30.24,0,0.1758,53.53,3450.43,30.24,34.61
++gfx950,256,8,1,128,16,8192,128,aiter,55.39,0,0.2044,58.30,3757.82,58.37,55.39
++gfx950,256,8,1,128,16,8192,256,mslk,97.72,0,0.1893,66.01,4254.80,97.72,119.93
++gfx950,256,8,1,128,16,16384,1,aiter,19.21,0,0.1377,3.49,225.17,27.76,19.21
++gfx950,256,8,1,128,16,16384,2,aiter,20.73,0,0.1258,5.67,365.20,31.03,20.73
++gfx950,256,8,1,128,16,16384,4,aiter,21.42,0,0.1558,10.18,656.21,31.23,21.42
++gfx950,256,8,1,128,16,16384,8,aiter,23.66,0,0.1566,17.73,1142.51,32.13,23.66
++gfx950,256,8,1,128,16,16384,16,aiter,24.55,0,0.1762,33.49,2158.51,33.45,24.55
++gfx950,256,8,1,128,16,16384,32,aiter,34.64,0,0.1609,46.98,3027.96,38.76,34.64
++gfx950,256,8,1,128,16,16384,64,mslk,54.19,0,0.1896,59.75,3851.11,54.19,54.12
++gfx950,256,8,1,128,16,16384,128,mslk,95.46,0,0.1699,67.66,4361.05,95.46,103.90
++gfx950,256,8,1,128,16,16384,256,mslk,187.86,0,0.1885,68.68,4426.53,187.86,234.08
++gfx950,256,8,1,128,16,32768,1,aiter,20.87,0,0.1387,6.43,414.60,57.10,20.87
++gfx950,256,8,1,128,16,32768,2,aiter,21.68,0,0.128,10.83,698.23,55.91,21.68
++gfx950,256,8,1,128,16,32768,4,aiter,24.37,0,0.1383,17.90,1153.70,56.18,24.37
++gfx950,256,8,1,128,16,32768,8,aiter,30.45,0,0.1561,27.55,1775.41,57.01,30.45
++gfx950,256,8,1,128,16,32768,16,aiter,36.47,0,0.195,45.08,2905.71,59.92,36.47
++gfx950,256,8,1,128,16,32768,32,aiter,54.48,0,0.1759,59.74,3850.53,69.40,54.48
++gfx950,256,8,1,128,16,32768,64,mslk,98.46,0,0.1699,65.77,4239.35,98.46,101.08
++gfx950,256,8,1,128,16,32768,128,mslk,193.76,0,0.1844,66.67,4297.33,193.76,200.19
++gfx950,256,8,1,128,16,65536,1,aiter,23.26,0,0.1097,11.54,743.76,106.95,23.26
++gfx950,256,8,1,128,16,65536,2,aiter,25.10,0,0.1112,18.72,1206.38,106.57,25.10
++gfx950,256,8,1,128,16,65536,4,aiter,33.13,0,0.1525,26.33,1697.29,106.08,33.13
++gfx950,256,8,1,128,16,65536,8,aiter,41.97,0,0.1428,39.97,2576.30,107.53,41.97
++gfx950,256,8,1,128,16,65536,16,aiter,57.99,0,0.1359,56.70,3654.76,110.85,57.99
++gfx950,256,8,1,128,16,65536,32,aiter,93.96,0,0.1457,69.28,4465.28,129.36,93.96
++gfx950,256,8,1,128,16,65536,64,mslk,190.41,0,0.1574,68.02,4384.14,190.41,189.84
++gfx950,256,8,1,128,16,131072,1,aiter,27.92,0,0.148,19.23,1239.28,208.52,27.92
++gfx950,256,8,1,128,16,131072,2,aiter,31.53,0,0.1277,29.80,1920.39,204.68,31.53
++gfx950,256,8,1,128,16,131072,4,aiter,43.03,0,0.1339,40.55,2613.39,206.12,43.03
++gfx950,256,8,1,128,16,131072,8,aiter,62.42,0,0.15,53.75,3464.48,206.86,62.42
++gfx950,256,8,1,128,16,131072,16,aiter,97.20,0,0.1472,67.66,4360.99,213.79,97.20
++gfx950,256,8,1,128,16,131072,32,aiter,183.53,0,0.1618,70.94,4572.06,248.71,183.53
++gfx950,256,8,1,128,64,256,1,mslk,7.24,0,0.1261,0.14,9.34,7.24,11.35
++gfx950,256,8,1,128,64,256,2,mslk,7.42,0,0.1202,0.25,15.93,7.42,11.66
++gfx950,256,8,1,128,64,256,4,mslk,7.61,0,0.1563,0.45,28.85,7.61,11.91
++gfx950,256,8,1,128,64,256,8,mslk,7.83,0,0.1359,0.84,53.96,7.83,12.01
++gfx950,256,8,1,128,64,256,16,mslk,8.06,0,0.1781,1.59,102.74,8.06,11.54
++gfx950,256,8,1,128,64,256,32,mslk,8.10,0,0.1518,3.14,202.43,8.10,11.77
++gfx950,256,8,1,128,64,256,64,mslk,9.64,0,0.2146,5.25,338.12,9.64,12.37
++gfx950,256,8,1,128,64,256,128,mslk,9.81,0,0.2833,10.28,662.89,9.81,14.07
++gfx950,256,8,1,128,64,256,256,mslk,11.35,0,0.3001,17.78,1146.20,11.35,15.25
++gfx950,256,8,1,128,64,512,1,mslk,7.57,0,0.126,0.28,17.86,7.57,11.88
++gfx950,256,8,1,128,64,512,2,mslk,7.60,0,0.1279,0.48,31.13,7.60,12.41
++gfx950,256,8,1,128,64,512,4,mslk,7.74,0,0.2146,0.88,56.75,7.74,12.53
++gfx950,256,8,1,128,64,512,8,mslk,7.96,0,0.2179,1.65,106.15,7.96,12.80
++gfx950,256,8,1,128,64,512,16,mslk,8.13,0,0.2035,3.16,203.78,8.13,11.76
++gfx950,256,8,1,128,64,512,32,mslk,8.43,0,0.1784,6.03,388.85,8.43,12.07
++gfx950,256,8,1,128,64,512,64,mslk,9.99,0,0.2372,10.13,652.87,9.99,13.84
++gfx950,256,8,1,128,64,512,128,mslk,10.58,0,0.1676,19.08,1229.69,10.58,14.87
++gfx950,256,8,1,128,64,512,256,mslk,13.80,0,0.2341,29.22,1883.34,13.80,17.39
++gfx950,256,8,1,128,64,1024,1,mslk,7.59,0,0.1109,0.55,35.60,7.59,12.30
++gfx950,256,8,1,128,64,1024,2,mslk,7.74,0,0.1093,0.95,61.10,7.74,12.81
++gfx950,256,8,1,128,64,1024,4,mslk,7.81,0,0.1293,1.75,112.51,7.81,13.29
++gfx950,256,8,1,128,64,1024,8,mslk,8.07,0,0.1535,3.25,209.43,8.07,13.31
++gfx950,256,8,1,128,64,1024,16,mslk,8.07,0,0.1388,6.37,410.59,8.07,11.79
++gfx950,256,8,1,128,64,1024,32,mslk,9.62,0,0.1516,10.58,681.78,9.62,13.71
++gfx950,256,8,1,128,64,1024,64,mslk,10.73,0,0.1922,18.87,1216.05,10.73,14.58
++gfx950,256,8,1,128,64,1024,128,mslk,12.85,0,0.1876,31.41,2024.65,12.85,16.96
++gfx950,256,8,1,128,64,1024,256,mslk,23.16,0,0.2367,34.82,2244.03,23.16,26.45
++gfx950,256,8,1,128,64,2048,1,mslk,7.65,0,0.1143,1.10,70.67,7.65,13.46
++gfx950,256,8,1,128,64,2048,2,mslk,7.88,0,0.1472,1.86,120.10,7.88,13.84
++gfx950,256,8,1,128,64,2048,4,mslk,7.90,0,0.1582,3.45,222.37,7.90,14.04
++gfx950,256,8,1,128,64,2048,8,mslk,8.09,0,0.1297,6.48,417.51,8.09,14.35
++gfx950,256,8,1,128,64,2048,16,mslk,9.56,0,0.1571,10.75,692.79,9.56,13.90
++gfx950,256,8,1,128,64,2048,32,mslk,10.21,0,0.1651,19.92,1283.93,10.21,14.64
++gfx950,256,8,1,128,64,2048,64,mslk,12.89,0,0.1752,31.39,2023.07,12.89,16.91
++gfx950,256,8,1,128,64,2048,128,mslk,18.62,0,0.1859,43.35,2794.13,18.62,23.41
++gfx950,256,8,1,128,64,2048,256,mslk,32.75,0,0.2163,49.25,3174.22,32.75,40.54
++gfx950,256,8,1,128,64,4096,1,mslk,9.76,0,0.1249,1.72,110.85,9.76,15.58
++gfx950,256,8,1,128,64,4096,2,mslk,9.81,0,0.1176,2.99,192.99,9.81,15.67
++gfx950,256,8,1,128,64,4096,4,mslk,9.83,0,0.1383,5.55,357.41,9.83,15.66
++gfx950,256,8,1,128,64,4096,8,mslk,11.97,0,0.1753,8.76,564.82,11.97,17.80
++gfx950,256,8,1,128,64,4096,16,mslk,12.39,0,0.1608,16.58,1068.78,12.39,15.37
++gfx950,256,8,1,128,64,4096,32,mslk,13.77,0,0.1813,29.54,1903.77,13.77,17.56
++gfx950,256,8,1,128,64,4096,64,mslk,18.75,0,0.1696,43.18,2783.35,18.75,23.87
++gfx950,256,8,1,128,64,4096,128,mslk,29.05,0,0.2308,55.58,3582.43,29.05,34.40
++gfx950,256,8,1,128,64,4096,256,mslk,54.84,0,0.1884,58.81,3790.57,54.84,68.03
++gfx950,256,8,1,128,64,8192,1,mslk,13.55,0,0.1336,2.48,159.59,13.55,19.22
++gfx950,256,8,1,128,64,8192,2,mslk,13.70,0,0.1209,4.29,276.35,13.70,19.41
++gfx950,256,8,1,128,64,8192,4,mslk,16.85,0,0.1772,6.47,417.25,16.85,21.24
++gfx950,256,8,1,128,64,8192,8,mslk,17.35,0,0.1376,12.09,779.20,17.35,21.66
++gfx950,256,8,1,128,64,8192,16,aiter,17.55,0,0.1687,23.43,1509.97,18.11,17.55
++gfx950,256,8,1,128,64,8192,32,mslk,21.09,0,0.1847,38.59,2486.99,21.09,23.91
++gfx950,256,8,1,128,64,8192,64,mslk,30.22,0,0.157,53.57,3452.88,30.22,35.24
++gfx950,256,8,1,128,64,8192,128,mslk,52.89,0,0.1692,61.06,3935.46,52.89,54.93
++gfx950,256,8,1,128,64,8192,256,mslk,87.85,0,0.2006,73.43,4732.77,87.85,119.27
++gfx950,256,8,1,128,64,16384,1,aiter,20.29,0,0.1359,3.31,213.21,24.52,20.29
++gfx950,256,8,1,128,64,16384,2,aiter,21.72,0,0.126,5.41,348.53,26.60,21.72
++gfx950,256,8,1,128,64,16384,4,aiter,22.38,0,0.1319,9.75,628.15,26.76,22.38
++gfx950,256,8,1,128,64,16384,8,aiter,24.74,0,0.128,16.95,1092.59,27.66,24.74
++gfx950,256,8,1,128,64,16384,16,aiter,25.63,0,0.152,32.07,2067.30,28.93,25.63
++gfx950,256,8,1,128,64,16384,32,mslk,34.46,0,0.1554,47.23,3044.04,34.46,34.59
++gfx950,256,8,1,128,64,16384,64,mslk,52.78,0,0.1807,61.35,3954.10,52.78,53.30
++gfx950,256,8,1,128,64,16384,128,mslk,91.14,0,0.2068,70.87,4567.73,91.14,99.48
++gfx950,256,8,1,128,64,16384,256,mslk,177.82,0,0.1803,72.55,4676.32,177.82,232.12
++gfx950,256,8,1,128,64,32768,1,aiter,21.87,0,0.1131,6.14,395.55,47.18,21.87
++gfx950,256,8,1,128,64,32768,2,aiter,22.78,0,0.1584,10.31,664.62,46.71,22.78
++gfx950,256,8,1,128,64,32768,4,aiter,25.41,0,0.1292,17.17,1106.64,46.93,25.41
++gfx950,256,8,1,128,64,32768,8,aiter,31.18,0,0.1614,26.91,1734.19,48.07,31.18
++gfx950,256,8,1,128,64,32768,16,aiter,36.84,0,0.1598,44.63,2876.59,51.20,36.84
++gfx950,256,8,1,128,64,32768,32,aiter,52.80,0,0.1535,61.64,3972.98,62.23,52.80
++gfx950,256,8,1,128,64,32768,64,mslk,94.47,0,0.1617,68.55,4418.10,94.47,97.49
++gfx950,256,8,1,128,64,32768,128,mslk,184.24,0,0.1754,70.12,4519.38,184.24,186.34
++gfx950,256,8,1,128,64,65536,1,aiter,24.24,0,0.122,11.07,713.66,87.86,24.24
++gfx950,256,8,1,128,64,65536,2,aiter,26.15,0,0.1287,17.97,1157.95,86.67,26.15
++gfx950,256,8,1,128,64,65536,4,aiter,32.41,0,0.1249,26.92,1735.20,87.46,32.41
++gfx950,256,8,1,128,64,65536,8,aiter,42.42,0,0.1356,39.55,2548.96,88.91,42.42
++gfx950,256,8,1,128,64,65536,16,aiter,56.57,0,0.185,58.13,3746.51,93.20,56.57
++gfx950,256,8,1,128,64,65536,32,aiter,89.86,0,0.1583,72.44,4669.03,113.06,89.86
++gfx950,256,8,1,128,64,65536,64,mslk,181.58,0,0.1862,71.33,4597.46,181.58,182.93
++gfx950,256,8,1,128,64,131072,1,aiter,28.34,0,0.1086,18.94,1221.02,169.02,28.34
++gfx950,256,8,1,128,64,131072,2,aiter,32.42,0,0.127,28.98,1867.87,166.80,32.42
++gfx950,256,8,1,128,64,131072,4,aiter,43.57,0,0.1453,40.05,2581.03,167.08,43.57
++gfx950,256,8,1,128,64,131072,8,aiter,62.92,0,0.1366,53.33,3437.32,171.06,62.92
++gfx950,256,8,1,128,64,131072,16,aiter,92.60,0,0.155,71.02,4577.59,177.10,92.60
++gfx950,256,8,1,128,64,131072,32,aiter,174.20,0,0.1678,74.74,4816.97,208.04,174.20
++gfx950,256,16,1,128,16,256,1,mslk,8.21,0,0.1173,0.26,8.23,8.21,10.79
++gfx950,256,16,1,128,16,256,2,mslk,8.51,0,0.1465,0.43,13.90,8.51,11.21
++gfx950,256,16,1,128,16,256,4,mslk,8.62,0,0.1546,0.79,25.48,8.62,11.28
++gfx950,256,16,1,128,16,256,8,mslk,8.88,0,0.1827,1.48,47.55,8.88,11.38
++gfx950,256,16,1,128,16,256,16,mslk,9.07,0,0.1572,2.83,91.26,9.07,10.87
++gfx950,256,16,1,128,16,256,32,mslk,9.16,0,0.228,5.55,178.83,9.16,11.08
++gfx950,256,16,1,128,16,256,64,mslk,10.94,0,0.1813,9.25,298.17,10.94,11.45
++gfx950,256,16,1,128,16,256,128,mslk,11.67,0,0.2099,17.29,557.17,11.67,12.55
++gfx950,256,16,1,128,16,256,256,aiter,13.84,0,0.2445,29.16,939.75,16.17,13.84
++gfx950,256,16,1,128,16,512,1,mslk,8.48,0,0.1161,0.49,15.93,8.48,11.33
++gfx950,256,16,1,128,16,512,2,mslk,8.58,0,0.1562,0.86,27.57,8.58,11.83
++gfx950,256,16,1,128,16,512,4,mslk,8.78,0,0.1449,1.55,50.06,8.78,11.82
++gfx950,256,16,1,128,16,512,8,mslk,9.06,0,0.1675,2.89,93.20,9.06,12.41
++gfx950,256,16,1,128,16,512,16,mslk,9.17,0,0.1744,5.60,180.63,9.17,11.01
++gfx950,256,16,1,128,16,512,32,mslk,9.91,0,0.2485,10.27,330.91,9.91,11.27
++gfx950,256,16,1,128,16,512,64,mslk,11.22,0,0.2764,18.04,581.31,11.22,12.71
++gfx950,256,16,1,128,16,512,128,mslk,12.73,0,0.2567,31.71,1021.77,12.73,13.53
++gfx950,256,16,1,128,16,512,256,aiter,16.89,0,0.2461,47.75,1538.77,19.00,16.89
++gfx950,256,16,1,128,16,1024,1,mslk,8.58,0,0.1361,0.98,31.49,8.58,11.79
++gfx950,256,16,1,128,16,1024,2,mslk,8.76,0,0.1249,1.68,53.98,8.76,12.25
++gfx950,256,16,1,128,16,1024,4,mslk,8.85,0,0.1543,3.08,99.25,8.85,12.44
++gfx950,256,16,1,128,16,1024,8,mslk,9.16,0,0.1701,5.72,184.40,9.16,12.59
++gfx950,256,16,1,128,16,1024,16,mslk,9.54,0,0.1709,10.77,347.19,9.54,11.13
++gfx950,256,16,1,128,16,1024,32,mslk,10.70,0,0.1846,19.02,612.95,10.70,12.61
++gfx950,256,16,1,128,16,1024,64,mslk,11.94,0,0.2146,33.91,1092.72,11.94,13.51
++gfx950,256,16,1,128,16,1024,128,mslk,15.09,0,0.2155,53.51,1724.30,15.09,16.00
++gfx950,256,16,1,128,16,1024,256,aiter,25.49,0,0.2278,63.26,2038.57,27.38,25.49
++gfx950,256,16,1,128,16,2048,1,mslk,8.73,0,0.1379,1.92,61.94,8.73,12.88
++gfx950,256,16,1,128,16,2048,2,mslk,8.91,0,0.144,3.30,106.19,8.91,13.29
++gfx950,256,16,1,128,16,2048,4,mslk,8.96,0,0.1687,6.09,196.12,8.96,13.41
++gfx950,256,16,1,128,16,2048,8,mslk,9.37,0,0.1504,11.19,360.53,9.37,13.62
++gfx950,256,16,1,128,16,2048,16,mslk,10.70,0,0.1803,19.20,618.71,10.70,12.78
++gfx950,256,16,1,128,16,2048,32,mslk,11.45,0,0.227,35.54,1145.44,11.45,13.57
++gfx950,256,16,1,128,16,2048,64,mslk,14.22,0,0.1853,56.91,1834.14,14.22,16.02
++gfx950,256,16,1,128,16,2048,128,aiter,22.19,0,0.2022,72.76,2344.66,24.97,22.19
++gfx950,256,16,1,128,16,2048,256,aiter,40.11,0,0.3136,80.42,2591.63,41.82,40.11
++gfx950,256,16,1,128,16,4096,1,mslk,11.14,0,0.1525,3.01,97.04,11.14,15.08
++gfx950,256,16,1,128,16,4096,2,mslk,11.22,0,0.1526,5.23,168.63,11.22,15.17
++gfx950,256,16,1,128,16,4096,4,mslk,11.29,0,0.1881,9.66,311.41,11.29,15.21
++gfx950,256,16,1,128,16,4096,8,mslk,13.73,0,0.1524,15.27,492.14,13.73,16.75
++gfx950,256,16,1,128,16,4096,16,mslk,14.12,0,0.2148,29.12,938.43,14.12,14.25
++gfx950,256,16,1,128,16,4096,32,mslk,15.50,0,0.1695,52.51,1692.13,15.50,16.82
++gfx950,256,16,1,128,16,4096,64,mslk,20.30,0,0.1701,79.76,2570.51,20.30,22.77
++gfx950,256,16,1,128,16,4096,128,aiter,33.86,0,0.189,95.37,3073.48,35.49,33.86
++gfx950,256,16,1,128,16,4096,256,mslk,61.09,0,0.1758,105.60,3403.03,61.09,66.78
++gfx950,256,16,1,128,16,8192,1,mslk,15.84,0,0.1945,4.24,136.56,15.84,18.78
++gfx950,256,16,1,128,16,8192,2,mslk,16.75,0,0.158,7.01,226.00,16.75,19.04
++gfx950,256,16,1,128,16,8192,4,mslk,19.76,0,0.1519,11.04,355.78,19.76,20.43
++gfx950,256,16,1,128,16,8192,8,mslk,20.26,0,0.1714,20.71,667.25,20.26,20.73
++gfx950,256,16,1,128,16,8192,16,aiter,16.54,0,0.1712,49.69,1601.38,20.99,16.54
++gfx950,256,16,1,128,16,8192,32,aiter,22.56,0,0.182,72.13,2324.48,24.03,22.56
++gfx950,256,16,1,128,16,8192,64,mslk,31.29,0,0.1694,103.50,3335.41,31.29,34.47
++gfx950,256,16,1,128,16,8192,128,aiter,55.91,0,0.1858,115.52,3722.88,60.07,55.91
++gfx950,256,16,1,128,16,8192,256,mslk,98.77,0,0.1904,130.62,4209.50,98.77,121.68
++gfx950,256,16,1,128,16,16384,1,aiter,19.52,0,0.1183,6.88,221.59,29.63,19.52
++gfx950,256,16,1,128,16,16384,2,aiter,20.77,0,0.1649,11.31,364.39,31.79,20.77
++gfx950,256,16,1,128,16,16384,4,aiter,21.52,0,0.1501,20.27,653.15,32.07,21.52
++gfx950,256,16,1,128,16,16384,8,aiter,24.29,0,0.1384,34.54,1113.08,32.97,24.29
++gfx950,256,16,1,128,16,16384,16,aiter,24.26,0,0.1638,67.79,2184.48,34.40,24.26
++gfx950,256,16,1,128,16,16384,32,aiter,34.55,0,0.1558,94.20,3035.79,39.77,34.55
++gfx950,256,16,1,128,16,16384,64,mslk,54.51,0,0.1729,118.79,3828.33,54.51,54.37
++gfx950,256,16,1,128,16,16384,128,mslk,100.48,0,0.2052,128.57,4143.37,100.48,105.04
++gfx950,256,16,1,128,16,16384,256,mslk,191.86,0,0.1757,134.49,4334.18,191.86,235.29
++gfx950,256,16,1,128,16,32768,1,aiter,21.68,0,0.114,12.38,399.10,57.47,21.68
++gfx950,256,16,1,128,16,32768,2,aiter,22.59,0,0.1301,20.80,670.26,56.58,22.59
++gfx950,256,16,1,128,16,32768,4,aiter,25.08,0,0.14,34.79,1121.02,57.12,25.08
++gfx950,256,16,1,128,16,32768,8,aiter,29.96,0,0.1835,55.99,1804.45,57.64,29.96
++gfx950,256,16,1,128,16,32768,16,aiter,36.11,0,0.153,91.06,2934.69,60.54,36.11
++gfx950,256,16,1,128,16,32768,32,aiter,54.25,0,0.1751,119.98,3866.57,70.25,54.25
++gfx950,256,16,1,128,16,32768,64,mslk,98.86,0,0.1969,131.01,4222.15,98.86,100.24
++gfx950,256,16,1,128,16,32768,128,mslk,196.56,0,0.1908,131.45,4236.06,196.56,194.20
++gfx950,256,16,1,128,16,65536,1,aiter,23.72,0,0.1388,22.63,729.37,107.78,23.72
++gfx950,256,16,1,128,16,65536,2,aiter,25.57,0,0.1423,36.75,1184.33,106.55,25.57
++gfx950,256,16,1,128,16,65536,4,aiter,31.25,0,0.1473,55.83,1799.15,107.18,31.25
++gfx950,256,16,1,128,16,65536,8,aiter,41.90,0,0.1494,80.07,2580.47,108.07,41.90
++gfx950,256,16,1,128,16,65536,16,aiter,57.90,0,0.1571,113.59,3660.59,111.97,57.90
++gfx950,256,16,1,128,16,65536,32,aiter,95.89,0,0.1669,135.76,4375.22,130.66,95.89
++gfx950,256,16,1,128,16,65536,64,mslk,190.84,0,0.1901,135.74,4374.39,190.84,193.85
++gfx950,256,16,1,128,16,131072,1,aiter,28.51,0,0.1297,37.66,1213.71,209.60,28.51
++gfx950,256,16,1,128,16,131072,2,aiter,32.06,0,0.1532,58.61,1888.75,205.38,32.06
++gfx950,256,16,1,128,16,131072,4,aiter,42.66,0,0.1739,81.81,2636.45,206.45,42.66
++gfx950,256,16,1,128,16,131072,8,aiter,63.42,0,0.1441,105.81,3409.97,207.65,63.42
++gfx950,256,16,1,128,16,131072,16,aiter,98.34,0,0.1872,133.75,4310.43,216.73,98.34
++gfx950,256,16,1,128,16,131072,32,aiter,184.56,0,0.1736,141.08,4546.59,246.29,184.56
++gfx950,256,16,1,128,64,256,1,mslk,8.08,0,0.1157,0.26,8.36,8.08,11.14
++gfx950,256,16,1,128,64,256,2,mslk,8.37,0,0.1295,0.44,14.13,8.37,11.91
++gfx950,256,16,1,128,64,256,4,mslk,8.49,0,0.1568,0.80,25.88,8.49,11.92
++gfx950,256,16,1,128,64,256,8,mslk,8.78,0,0.1587,1.49,48.12,8.78,11.84
++gfx950,256,16,1,128,64,256,16,mslk,8.93,0,0.1767,2.88,92.66,8.93,11.37
++gfx950,256,16,1,128,64,256,32,mslk,9.03,0,0.1689,5.63,181.57,9.03,11.42
++gfx950,256,16,1,128,64,256,64,mslk,10.87,0,0.1885,9.31,300.11,10.87,12.55
++gfx950,256,16,1,128,64,256,128,mslk,10.94,0,0.1826,18.45,594.64,10.94,14.04
++gfx950,256,16,1,128,64,256,256,mslk,12.82,0,0.1912,31.50,1015.05,12.82,15.59
++gfx950,256,16,1,128,64,512,1,mslk,8.28,0,0.09381,0.51,16.33,8.28,11.64
++gfx950,256,16,1,128,64,512,2,mslk,8.46,0,0.1281,0.87,27.96,8.46,12.32
++gfx950,256,16,1,128,64,512,4,mslk,8.63,0,0.1356,1.58,50.88,8.63,12.22
++gfx950,256,16,1,128,64,512,8,mslk,8.91,0,0.1778,2.94,94.81,8.91,12.62
++gfx950,256,16,1,128,64,512,16,mslk,8.95,0,0.1609,5.74,184.93,8.95,11.36
++gfx950,256,16,1,128,64,512,32,mslk,9.62,0,0.1789,10.57,340.58,9.62,11.99
++gfx950,256,16,1,128,64,512,64,mslk,11.08,0,0.2383,18.27,588.64,11.08,13.79
++gfx950,256,16,1,128,64,512,128,mslk,11.71,0,0.2389,34.47,1110.91,11.71,15.14
++gfx950,256,16,1,128,64,512,256,mslk,15.39,0,0.2759,52.38,1688.16,15.39,17.86
++gfx950,256,16,1,128,64,1024,1,mslk,8.43,0,0.108,0.99,32.06,8.43,12.31
++gfx950,256,16,1,128,64,1024,2,mslk,8.59,0,0.1454,1.71,55.08,8.59,12.75
++gfx950,256,16,1,128,64,1024,4,mslk,8.69,0,0.1356,3.14,101.16,8.69,12.99
++gfx950,256,16,1,128,64,1024,8,mslk,8.97,0,0.174,5.85,188.45,8.97,13.34
++gfx950,256,16,1,128,64,1024,16,mslk,9.59,0,0.2274,10.72,345.49,9.59,11.60
++gfx950,256,16,1,128,64,1024,32,mslk,10.54,0,0.1533,19.29,621.77,10.54,13.72
++gfx950,256,16,1,128,64,1024,64,mslk,11.82,0,0.2211,34.24,1103.41,11.82,14.68
++gfx950,256,16,1,128,64,1024,128,mslk,13.99,0,0.2496,57.73,1860.39,13.99,17.05
++gfx950,256,16,1,128,64,1024,256,mslk,24.77,0,0.2134,65.11,2098.23,24.77,26.57
++gfx950,256,16,1,128,64,2048,1,mslk,8.48,0,0.1231,1.98,63.75,8.48,13.21
++gfx950,256,16,1,128,64,2048,2,mslk,8.69,0,0.1679,3.38,108.92,8.69,13.73
++gfx950,256,16,1,128,64,2048,4,mslk,8.85,0,0.1553,6.16,198.63,8.85,13.89
++gfx950,256,16,1,128,64,2048,8,mslk,9.11,0,0.1406,11.51,370.92,9.11,14.11
++gfx950,256,16,1,128,64,2048,16,mslk,10.48,0,0.2132,19.61,632.00,10.48,13.74
++gfx950,256,16,1,128,64,2048,32,mslk,11.20,0,0.1742,36.34,1171.01,11.20,14.64
++gfx950,256,16,1,128,64,2048,64,mslk,14.01,0,0.2606,57.79,1862.38,14.01,16.88
++gfx950,256,16,1,128,64,2048,128,mslk,19.49,0,0.2424,82.85,2669.93,19.49,23.27
++gfx950,256,16,1,128,64,2048,256,mslk,34.61,0,0.2712,93.20,3003.65,34.61,41.49
++gfx950,256,16,1,128,64,4096,1,mslk,10.58,0,0.117,3.17,102.18,10.58,15.40
++gfx950,256,16,1,128,64,4096,2,mslk,10.64,0,0.1283,5.52,177.86,10.64,15.66
++gfx950,256,16,1,128,64,4096,4,mslk,10.83,0,0.1526,10.07,324.48,10.83,15.92
++gfx950,256,16,1,128,64,4096,8,mslk,12.93,0,0.1516,16.22,522.78,12.93,17.81
++gfx950,256,16,1,128,64,4096,16,mslk,13.34,0,0.1878,30.81,992.94,13.34,15.36
++gfx950,256,16,1,128,64,4096,32,mslk,14.77,0,0.1699,55.11,1775.98,14.77,17.83
++gfx950,256,16,1,128,64,4096,64,mslk,19.63,0,0.1931,82.49,2658.37,19.63,23.95
++gfx950,256,16,1,128,64,4096,128,mslk,31.04,0,0.1975,104.05,3353.20,31.04,35.23
++gfx950,256,16,1,128,64,4096,256,mslk,56.84,0,0.2019,113.49,3657.51,56.84,69.21
++gfx950,256,16,1,128,64,8192,1,mslk,14.40,0,0.1245,4.66,150.22,14.40,19.07
++gfx950,256,16,1,128,64,8192,2,mslk,14.65,0,0.12,8.02,258.42,14.65,19.35
++gfx950,256,16,1,128,64,8192,4,mslk,17.67,0,0.1316,12.34,397.76,17.67,21.26
++gfx950,256,16,1,128,64,8192,8,mslk,18.31,0,0.144,22.91,738.27,18.31,21.87
++gfx950,256,16,1,128,64,8192,16,aiter,17.44,0,0.1568,47.13,1518.83,19.16,17.44
++gfx950,256,16,1,128,64,8192,32,mslk,22.05,0,0.1766,73.81,2378.62,22.05,23.71
++gfx950,256,16,1,128,64,8192,64,mslk,30.70,0,0.1691,105.47,3399.09,30.70,35.31
++gfx950,256,16,1,128,64,8192,128,mslk,53.87,0,0.1766,119.91,3864.33,53.87,54.77
++gfx950,256,16,1,128,64,8192,256,mslk,92.94,0,0.2064,138.81,4473.42,92.94,120.39
++gfx950,256,16,1,128,64,16384,1,aiter,20.48,0,0.1042,6.55,211.24,25.62,20.48
++gfx950,256,16,1,128,64,16384,2,aiter,21.77,0,0.1354,10.79,347.64,27.45,21.77
++gfx950,256,16,1,128,64,16384,4,aiter,22.44,0,0.1452,19.44,626.56,27.61,22.44
++gfx950,256,16,1,128,64,16384,8,aiter,25.06,0,0.1551,33.47,1078.59,28.60,25.06
++gfx950,256,16,1,128,64,16384,16,aiter,25.17,0,0.158,65.32,2105.11,30.05,25.17
++gfx950,256,16,1,128,64,16384,32,mslk,35.49,0,0.1838,91.70,2955.13,35.49,35.15
++gfx950,256,16,1,128,64,16384,64,mslk,54.63,0,0.1731,118.55,3820.47,54.63,53.55
++gfx950,256,16,1,128,64,16384,128,mslk,93.73,0,0.197,137.82,4441.47,93.73,101.62
++gfx950,256,16,1,128,64,16384,256,mslk,179.04,0,0.2039,144.12,4644.44,179.04,237.97
++gfx950,256,16,1,128,64,32768,1,aiter,22.39,0,0.1058,11.99,386.44,48.16,22.39
++gfx950,256,16,1,128,64,32768,2,aiter,23.65,0,0.1213,19.87,640.21,47.43,23.65
++gfx950,256,16,1,128,64,32768,4,aiter,25.83,0,0.1416,33.78,1088.57,47.85,25.83
++gfx950,256,16,1,128,64,32768,8,aiter,31.43,0,0.1504,53.38,1720.41,49.12,31.43
++gfx950,256,16,1,128,64,32768,16,aiter,36.65,0,0.1632,89.72,2891.46,51.68,36.65
++gfx950,256,16,1,128,64,32768,32,aiter,53.38,0,0.1885,121.95,3929.91,62.44,53.38
++gfx950,256,16,1,128,64,32768,64,mslk,94.43,0,0.1896,137.16,4420.29,94.43,98.32
++gfx950,256,16,1,128,64,32768,128,mslk,186.75,0,0.2224,138.35,4458.59,186.75,189.45
++gfx950,256,16,1,128,64,65536,1,aiter,24.63,0,0.1151,21.80,702.46,88.38,24.63
++gfx950,256,16,1,128,64,65536,2,aiter,26.85,0,0.1336,34.99,1127.72,87.50,26.85
++gfx950,256,16,1,128,64,65536,4,aiter,32.36,0,0.1413,53.92,1737.75,88.37,32.36
++gfx950,256,16,1,128,64,65536,8,aiter,42.58,0,0.137,78.81,2539.69,90.16,42.58
++gfx950,256,16,1,128,64,65536,16,aiter,56.83,0,0.1762,115.72,3729.27,93.51,56.83
++gfx950,256,16,1,128,64,65536,32,aiter,91.00,0,0.1813,143.07,4610.67,115.69,91.00
++gfx950,256,16,1,128,64,65536,64,mslk,185.22,0,0.1781,139.85,4506.95,185.22,186.64
++gfx950,256,16,1,128,64,131072,1,aiter,29.06,0,0.1315,36.94,1190.54,169.66,29.06
++gfx950,256,16,1,128,64,131072,2,aiter,33.09,0,0.1232,56.78,1829.86,167.99,33.09
++gfx950,256,16,1,128,64,131072,4,aiter,43.58,0,0.1542,80.08,2580.64,168.63,43.58
++gfx950,256,16,1,128,64,131072,8,aiter,62.74,0,0.151,106.97,3447.28,170.76,62.74
++gfx950,256,16,1,128,64,131072,16,aiter,93.66,0,0.1662,140.44,4525.86,178.04,93.66
++gfx950,256,16,1,128,64,131072,32,aiter,178.43,0,0.164,145.93,4702.72,212.28,178.43
++gfx950,256,32,8,128,16,256,1,mslk,7.66,0,0.1359,0.55,70.54,7.66,12.36
++gfx950,256,32,8,128,16,256,2,mslk,7.92,0,0.1393,0.93,119.53,7.92,11.82
++gfx950,256,32,8,128,16,256,4,mslk,8.02,0,0.1388,1.70,218.97,8.02,11.94
++gfx950,256,32,8,128,16,256,8,mslk,8.48,0,0.1745,3.09,398.42,8.48,12.11
++gfx950,256,32,8,128,16,256,16,mslk,10.06,0,0.198,5.11,658.58,10.06,14.86
++gfx950,256,32,8,128,16,256,32,mslk,13.18,0,0.1729,7.72,995.06,13.18,15.30
++gfx950,256,32,8,128,16,256,64,aiter,16.94,0,0.2124,11.95,1539.79,20.76,16.94
++gfx950,256,32,8,128,16,256,128,aiter,21.87,0,0.2308,18.46,2379.65,38.78,21.87
++gfx950,256,32,8,128,16,256,256,aiter,37.23,0,0.2072,21.69,2795.88,86.80,37.23
++gfx950,256,32,8,128,16,512,1,mslk,7.87,0,0.1411,1.07,137.37,7.87,13.06
++gfx950,256,32,8,128,16,512,2,mslk,8.02,0,0.133,1.83,235.89,8.02,11.82
++gfx950,256,32,8,128,16,512,4,mslk,8.02,0,0.1698,3.40,438.24,8.02,12.18
++gfx950,256,32,8,128,16,512,8,mslk,9.92,0,0.1866,5.28,681.00,9.92,14.73
++gfx950,256,32,8,128,16,512,16,mslk,10.91,0,0.1732,9.42,1214.10,10.91,15.28
++gfx950,256,32,8,128,16,512,32,mslk,16.01,0,0.1993,12.70,1637.56,16.01,16.68
++gfx950,256,32,8,128,16,512,64,aiter,23.40,0,0.2011,17.30,2229.83,28.74,23.40
++gfx950,256,32,8,128,16,512,128,aiter,34.58,0,0.2177,23.35,3010.03,57.86,34.58
++gfx950,256,32,8,128,16,512,256,aiter,60.65,0,0.2658,26.59,3427.91,120.10,60.65
++gfx950,256,32,8,128,16,1024,1,mslk,7.87,0,0.1429,2.13,274.76,7.87,13.75
++gfx950,256,32,8,128,16,1024,2,mslk,8.34,0,0.1388,3.52,453.55,8.34,12.96
++gfx950,256,32,8,128,16,1024,4,mslk,9.56,0,0.1935,5.70,735.30,9.56,14.75
++gfx950,256,32,8,128,16,1024,8,mslk,10.64,0,0.1931,9.86,1270.39,10.64,15.02
++gfx950,256,32,8,128,16,1024,16,mslk,13.33,0,0.1631,15.42,1987.98,13.33,16.23
++gfx950,256,32,8,128,16,1024,32,mslk,24.72,0,0.2103,16.46,2121.91,24.72,27.48
++gfx950,256,32,8,128,16,1024,64,aiter,36.77,0,0.1948,22.02,2838.28,42.98,36.77
++gfx950,256,32,8,128,16,1024,128,aiter,56.58,0,0.2719,28.54,3678.98,80.11,56.58
++gfx950,256,32,8,128,16,1024,256,aiter,104.28,0,0.2116,30.93,3987.30,170.17,104.28
++gfx950,256,32,8,128,16,2048,1,mslk,8.44,0,0.1183,3.98,512.73,8.44,16.04
++gfx950,256,32,8,128,16,2048,2,mslk,9.62,0,0.1539,6.10,786.65,9.62,14.90
++gfx950,256,32,8,128,16,2048,4,mslk,10.27,0,0.1436,10.62,1368.50,10.27,15.31
++gfx950,256,32,8,128,16,2048,8,mslk,12.99,0,0.161,16.14,2080.67,12.99,16.56
++gfx950,256,32,8,128,16,2048,16,mslk,23.03,0,0.245,17.85,2300.94,23.03,24.08
++gfx950,256,32,8,128,16,2048,32,mslk,39.60,0,0.1832,20.55,2648.90,39.60,44.47
++gfx950,256,32,8,128,16,2048,64,aiter,63.22,0,0.2007,25.61,3300.95,68.88,63.22
++gfx950,256,32,8,128,16,2048,128,aiter,99.35,0,0.3226,32.51,4190.61,132.38,99.35
++gfx950,256,32,8,128,16,2048,256,aiter,191.43,0,0.238,33.70,4343.84,245.74,191.43
++gfx950,256,32,8,128,16,4096,1,mslk,12.50,0,0.1578,5.37,692.15,12.50,19.17
++gfx950,256,32,8,128,16,4096,2,mslk,12.89,0,0.1775,9.11,1174.17,12.89,16.05
++gfx950,256,32,8,128,16,4096,4,mslk,14.51,0,0.143,15.03,1938.07,14.51,17.26
++gfx950,256,32,8,128,16,4096,8,mslk,19.11,0,0.1683,21.95,2829.22,19.11,25.05
++gfx950,256,32,8,128,16,4096,16,mslk,33.21,0,0.2665,24.76,3191.38,33.21,36.52
++gfx950,256,32,8,128,16,4096,32,mslk,59.55,0,0.1708,27.33,3522.82,59.55,74.73
++gfx950,256,32,8,128,16,4096,64,mslk,109.83,0,0.2093,29.48,3800.36,109.83,110.27
++gfx950,256,32,8,128,16,4096,128,aiter,190.12,0,0.2147,33.97,4379.56,198.43,190.12
++gfx950,256,32,8,128,16,4096,256,aiter,341.41,0,0.2027,37.79,4871.28,411.35,341.41
++gfx950,256,32,8,128,16,8192,1,mslk,18.91,0,0.1165,7.10,914.89,18.91,23.18
++gfx950,256,32,8,128,16,8192,2,aiter,17.55,0,0.1578,13.38,1725.25,19.41,17.55
++gfx950,256,32,8,128,16,8192,4,mslk,23.02,0,0.1604,18.95,2443.04,23.02,24.82
++gfx950,256,32,8,128,16,8192,8,mslk,30.47,0,0.1723,27.53,3548.55,30.47,37.64
++gfx950,256,32,8,128,16,8192,16,mslk,55.10,0,0.1968,29.84,3846.64,55.10,62.64
++gfx950,256,32,8,128,16,8192,32,mslk,102.15,0,0.1798,31.86,4107.50,102.15,133.62
++gfx950,256,32,8,128,16,8192,64,mslk,184.25,0,0.1998,35.15,4530.75,184.25,222.82
++gfx950,256,32,8,128,16,8192,128,mslk,365.77,0,0.1954,35.32,4552.79,365.77,356.85
++gfx950,256,32,8,128,16,8192,256,mslk,686.32,0,0.19,37.60,4846.45,686.32,666.42
++gfx950,256,32,8,128,16,16384,1,aiter,25.32,0,0.1354,10.60,1366.47,31.59,25.32
++gfx950,256,32,8,128,16,16384,2,aiter,26.19,0,0.1307,17.94,2311.98,32.72,26.19
++gfx950,256,32,8,128,16,16384,4,aiter,37.86,0,0.1523,23.04,2970.38,39.34,37.86
++gfx950,256,32,8,128,16,16384,8,mslk,51.53,0,0.1896,32.56,4197.32,51.53,62.79
++gfx950,256,32,8,128,16,16384,16,mslk,102.73,0,0.2079,32.01,4126.20,102.73,116.29
++gfx950,256,32,8,128,16,16384,32,mslk,178.64,0,0.2053,36.44,4697.39,178.64,256.06
++gfx950,256,32,8,128,16,16384,64,mslk,338.45,0,0.2138,38.27,4933.06,338.45,410.70
++gfx950,256,32,8,128,16,16384,128,mslk,652.25,0,0.1842,39.61,5106.23,652.25,679.49
++gfx950,256,32,8,128,16,16384,256,mslk,1276.70,0,0.1993,40.42,5210.66,1276.70,1322.85
++gfx950,256,32,8,128,16,32768,1,aiter,33.01,0,0.1506,16.26,2096.26,56.94,33.01
++gfx950,256,32,8,128,16,32768,2,aiter,39.86,0,0.1611,23.57,3038.69,57.86,39.86
++gfx950,256,32,8,128,16,32768,4,aiter,60.16,0,0.1497,29.00,3738.63,69.27,60.16
++gfx950,256,32,8,128,16,32768,8,mslk,96.47,0,0.1616,34.78,4483.60,96.47,107.04
++gfx950,256,32,8,128,16,32768,16,mslk,189.16,0,0.1607,34.77,4481.87,189.16,221.26
++gfx950,256,32,8,128,16,32768,32,mslk,341.76,0,0.178,38.09,4910.66,341.76,496.38
++gfx950,256,32,8,128,16,32768,64,mslk,630.21,0,0.1797,41.10,5298.50,630.21,793.12
++gfx950,256,32,8,128,16,32768,128,mslk,1251.13,0,0.2055,41.30,5324.04,1251.13,1520.58
++gfx950,256,32,8,128,16,65536,1,aiter,48.74,0,0.1424,22.03,2839.93,106.58,48.74
++gfx950,256,32,8,128,16,65536,2,aiter,65.93,0,0.1449,28.50,3674.01,107.98,65.93
++gfx950,256,32,8,128,16,65536,4,aiter,109.51,0,0.1448,31.87,4107.91,126.41,109.51
++gfx950,256,32,8,128,16,65536,8,mslk,182.33,0,0.1725,36.81,4744.60,182.33,201.20
++gfx950,256,32,8,128,16,65536,16,mslk,352.19,0,0.1553,37.35,4814.34,352.19,408.08
++gfx950,256,32,8,128,16,65536,32,mslk,661.69,0,0.1761,39.35,5072.61,661.69,974.86
++gfx950,256,32,8,128,16,65536,64,mslk,1238.98,0,0.1758,41.81,5390.20,1238.98,1582.57
++gfx950,256,32,8,128,16,131072,1,aiter,77.68,0,0.1632,27.65,3563.75,206.24,77.68
++gfx950,256,32,8,128,16,131072,2,aiter,117.11,0,0.1459,32.09,4136.65,208.61,117.11
++gfx950,256,32,8,128,16,131072,4,aiter,200.28,0,0.1646,34.85,4492.17,238.51,200.28
++gfx950,256,32,8,128,16,131072,8,mslk,342.34,0,0.1715,39.21,5053.93,342.34,388.35
++gfx950,256,32,8,128,16,131072,16,mslk,693.41,0,0.1907,37.94,4890.49,693.41,788.26
++gfx950,256,32,8,128,16,131072,32,mslk,1297.93,0,0.1875,40.12,5172.08,1297.93,1999.91
++gfx950,256,32,8,128,64,256,1,mslk,7.58,0,0.1344,0.55,71.37,7.58,11.85
++gfx950,256,32,8,128,64,256,2,mslk,7.77,0,0.1546,0.94,121.75,7.77,11.12
++gfx950,256,32,8,128,64,256,4,mslk,7.84,0,0.1594,1.74,224.15,7.84,11.14
++gfx950,256,32,8,128,64,256,8,mslk,8.66,0,0.1771,3.03,390.36,8.66,12.29
++gfx950,256,32,8,128,64,256,16,mslk,9.56,0,0.1781,5.37,692.78,9.56,14.10
++gfx950,256,32,8,128,64,256,32,mslk,10.97,0,0.1777,9.27,1194.94,10.97,14.76
++gfx950,256,32,8,128,64,256,64,mslk,16.47,0,0.2177,12.29,1583.93,16.47,16.43
++gfx950,256,32,8,128,64,256,128,aiter,21.79,0,0.2514,18.53,2388.12,31.86,21.79
++gfx950,256,32,8,128,64,256,256,aiter,36.60,0,0.2542,22.06,2843.37,63.55,36.60
++gfx950,256,32,8,128,64,512,1,mslk,7.68,0,0.1378,1.09,140.75,7.68,12.46
++gfx950,256,32,8,128,64,512,2,mslk,7.85,0,0.1647,1.87,241.15,7.85,11.17
++gfx950,256,32,8,128,64,512,4,mslk,7.91,0,0.1546,3.45,444.24,7.91,11.58
++gfx950,256,32,8,128,64,512,8,mslk,9.74,0,0.1594,5.38,694.10,9.74,13.80
++gfx950,256,32,8,128,64,512,16,mslk,10.29,0,0.1939,9.99,1287.66,10.29,14.28
++gfx950,256,32,8,128,64,512,32,mslk,13.24,0,0.2015,15.37,1980.99,13.24,15.71
++gfx950,256,32,8,128,64,512,64,aiter,22.11,0,0.2231,18.31,2360.29,24.94,22.11
++gfx950,256,32,8,128,64,512,128,aiter,31.84,0,0.2143,25.36,3269.16,45.92,31.84
++gfx950,256,32,8,128,64,512,256,aiter,59.59,0,0.2406,27.06,3488.76,85.40,59.59
++gfx950,256,32,8,128,64,1024,1,mslk,7.70,0,0.1273,2.18,280.69,7.70,13.07
++gfx950,256,32,8,128,64,1024,2,mslk,7.91,0,0.1419,3.71,478.41,7.91,11.56
++gfx950,256,32,8,128,64,1024,4,mslk,9.32,0,0.158,5.85,754.05,9.32,13.73
++gfx950,256,32,8,128,64,1024,8,mslk,10.43,0,0.1565,10.05,1295.37,10.43,13.98
++gfx950,256,32,8,128,64,1024,16,mslk,12.51,0,0.1782,16.43,2117.74,12.51,15.63
++gfx950,256,32,8,128,64,1024,32,mslk,23.38,0,0.2254,17.40,2243.55,23.38,25.74
++gfx950,256,32,8,128,64,1024,64,aiter,33.78,0,0.2041,23.96,3088.73,38.79,33.78
++gfx950,256,32,8,128,64,1024,128,aiter,55.56,0,0.2932,29.06,3746.59,68.19,55.56
++gfx950,256,32,8,128,64,1024,256,aiter,94.86,0,0.2527,34.00,4383.24,134.91,94.86
++gfx950,256,32,8,128,64,2048,1,mslk,8.28,0,0.123,4.05,522.40,8.28,15.59
++gfx950,256,32,8,128,64,2048,2,mslk,9.39,0,0.1413,6.26,806.42,9.39,13.91
++gfx950,256,32,8,128,64,2048,4,mslk,10.06,0,0.1514,10.84,1396.76,10.06,14.29
++gfx950,256,32,8,128,64,2048,8,mslk,12.80,0,0.2154,16.38,2111.74,12.80,15.63
++gfx950,256,32,8,128,64,2048,16,mslk,17.81,0,0.1883,23.08,2975.14,17.81,22.65
++gfx950,256,32,8,128,64,2048,32,mslk,33.74,0,0.1844,24.11,3108.46,33.74,40.04
++gfx950,256,32,8,128,64,2048,64,mslk,56.90,0,0.1798,28.46,3668.09,56.90,58.07
++gfx950,256,32,8,128,64,2048,128,aiter,95.20,0,0.189,33.93,4373.15,108.23,95.20
++gfx950,256,32,8,128,64,2048,256,aiter,185.53,0,0.2508,34.77,4482.15,204.18,185.53
++gfx950,256,32,8,128,64,4096,1,mslk,11.79,0,0.1601,5.69,733.57,11.79,18.19
++gfx950,256,32,8,128,64,4096,2,mslk,12.22,0,0.1395,9.61,1238.72,12.22,15.14
++gfx950,256,32,8,128,64,4096,4,mslk,13.92,0,0.1542,15.67,2019.60,13.92,16.65
++gfx950,256,32,8,128,64,4096,8,mslk,18.72,0,0.1792,22.40,2887.54,18.72,23.34
++gfx950,256,32,8,128,64,4096,16,mslk,28.73,0,0.1823,28.62,3688.97,28.73,33.83
++gfx950,256,32,8,128,64,4096,32,mslk,53.91,0,0.196,30.19,3891.39,53.91,64.46
++gfx950,256,32,8,128,64,4096,64,mslk,99.66,0,0.1972,32.49,4188.33,99.66,99.00
++gfx950,256,32,8,128,64,4096,128,mslk,176.73,0,0.19,36.55,4711.30,176.73,190.04
++gfx950,256,32,8,128,64,4096,256,aiter,334.75,0,0.2274,38.54,4968.16,359.43,334.75
++gfx950,256,32,8,128,64,8192,1,mslk,17.11,0,0.1347,7.84,1011.07,17.11,22.12
++gfx950,256,32,8,128,64,8192,2,aiter,16.66,0,0.1531,14.10,1817.12,18.13,16.66
++gfx950,256,32,8,128,64,8192,4,mslk,21.41,0,0.1644,20.37,2626.07,21.41,22.92
++gfx950,256,32,8,128,64,8192,8,mslk,30.44,0,0.1804,27.56,3552.88,30.44,35.15
++gfx950,256,32,8,128,64,8192,16,mslk,49.80,0,0.1751,33.01,4255.54,49.80,57.13
++gfx950,256,32,8,128,64,8192,32,mslk,97.70,0,0.257,33.31,4294.23,97.70,112.38
++gfx950,256,32,8,128,64,8192,64,mslk,175.45,0,0.1904,36.91,4758.09,175.45,192.75
++gfx950,256,32,8,128,64,8192,128,mslk,336.52,0,0.2304,38.39,4948.47,336.52,349.66
++gfx950,256,32,8,128,64,8192,256,mslk,629.11,0,0.2091,41.02,5287.15,629.11,636.77
++gfx950,256,32,8,128,64,16384,1,aiter,24.43,0,0.1491,10.99,1416.23,27.81,24.43
++gfx950,256,32,8,128,64,16384,2,aiter,24.51,0,0.1528,19.17,2470.83,29.03,24.51
++gfx950,256,32,8,128,64,16384,4,mslk,35.61,0,0.1517,24.50,3158.20,35.61,35.10
++gfx950,256,32,8,128,64,16384,8,mslk,51.04,0,0.1466,32.87,4237.16,51.04,56.79
++gfx950,256,32,8,128,64,16384,16,mslk,91.27,0,0.1657,36.03,4644.10,91.27,96.57
++gfx950,256,32,8,128,64,16384,32,mslk,178.86,0,0.1983,36.39,4691.51,178.86,217.48
++gfx950,256,32,8,128,64,16384,64,mslk,337.70,0,0.2166,38.35,4944.01,337.70,362.53
++gfx950,256,32,8,128,64,16384,128,mslk,617.64,0,0.1967,41.83,5392.37,617.64,664.30
++gfx950,256,32,8,128,64,16384,256,mslk,1220.41,0,0.2451,42.29,5450.98,1220.41,1253.65
++gfx950,256,32,8,128,64,32768,1,aiter,31.37,0,0.1255,17.11,2205.88,50.00,31.37
++gfx950,256,32,8,128,64,32768,2,aiter,36.77,0,0.1573,25.55,3293.92,51.64,36.77
++gfx950,256,32,8,128,64,32768,4,aiter,54.79,0,0.1517,31.84,4104.85,63.07,54.79
++gfx950,256,32,8,128,64,32768,8,mslk,97.22,0,0.1624,34.51,4449.15,97.22,98.04
++gfx950,256,32,8,128,64,32768,16,mslk,175.68,0,0.1926,37.44,4825.77,175.68,190.16
++gfx950,256,32,8,128,64,32768,32,mslk,336.37,0,0.186,38.70,4989.29,336.37,403.01
++gfx950,256,32,8,128,64,32768,64,mslk,626.35,0,0.1779,41.36,5331.21,626.35,686.57
++gfx950,256,32,8,128,64,32768,128,mslk,1241.94,0,0.1982,41.61,5363.43,1241.94,1414.43
++gfx950,256,32,8,128,64,65536,1,aiter,44.81,0,0.1409,23.96,3088.61,91.41,44.81
++gfx950,256,32,8,128,64,65536,2,aiter,58.91,0,0.1308,31.90,4111.63,95.92,58.91
++gfx950,256,32,8,128,64,65536,4,aiter,99.07,0,0.1554,35.23,4540.74,115.03,99.07
++gfx950,256,32,8,128,64,65536,8,mslk,179.82,0,0.1679,37.32,4810.71,179.82,178.42
++gfx950,256,32,8,128,64,65536,16,mslk,339.57,0,0.1783,38.74,4993.21,339.57,364.61
++gfx950,256,32,8,128,64,65536,32,mslk,678.40,0,0.166,38.38,4947.67,678.40,806.61
++gfx950,256,32,8,128,64,65536,64,mslk,1264.66,0,0.2091,40.97,5280.77,1264.66,1360.54
++gfx950,256,32,8,128,64,131072,1,aiter,71.64,0,0.1317,29.97,3863.94,175.75,71.64
++gfx950,256,32,8,128,64,131072,2,aiter,104.92,0,0.163,35.82,4617.34,183.90,104.92
++gfx950,256,32,8,128,64,131072,4,aiter,182.68,0,0.1545,38.21,4924.94,219.08,182.68
++gfx950,256,32,8,128,64,131072,8,mslk,342.67,0,0.1617,39.17,5049.09,342.67,338.90
++gfx950,256,32,8,128,64,131072,16,mslk,664.86,0,0.1692,39.57,5100.45,664.86,696.50
++gfx950,256,32,8,128,64,131072,32,mslk,1350.26,0,0.1763,38.57,4971.61,1350.26,1642.93
++gfx950,256,64,8,128,16,256,1,mslk,7.98,0,0.1336,1.05,67.77,7.98,11.32
++gfx950,256,64,8,128,16,256,2,mslk,8.17,0,0.1605,1.80,115.88,8.17,10.76
++gfx950,256,64,8,128,16,256,4,mslk,8.25,0,0.1516,3.31,213.10,8.25,10.75
++gfx950,256,64,8,128,16,256,8,mslk,9.28,0,0.2566,5.65,363.96,9.28,11.46
++gfx950,256,64,8,128,16,256,16,mslk,10.44,0,0.1926,9.85,634.54,10.44,13.08
++gfx950,256,64,8,128,16,256,32,mslk,14.07,0,0.2131,14.45,931.57,14.07,14.03
++gfx950,256,64,8,128,16,256,64,aiter,15.89,0,0.2275,25.47,1641.67,23.45,15.89
++gfx950,256,64,8,128,16,256,128,aiter,25.36,0,0.2265,31.84,2051.98,43.00,25.36
++gfx950,256,64,8,128,16,256,256,aiter,39.50,0,0.2483,40.88,2634.67,93.66,39.50
++gfx950,256,64,8,128,16,512,1,mslk,8.17,0,0.1354,2.05,132.38,8.17,12.16
++gfx950,256,64,8,128,16,512,2,mslk,8.25,0,0.1455,3.56,229.41,8.25,10.81
++gfx950,256,64,8,128,16,512,4,mslk,8.62,0,0.3843,6.32,407.63,8.62,11.23
++gfx950,256,64,8,128,16,512,8,mslk,10.20,0,0.2328,10.28,662.62,10.20,12.99
++gfx950,256,64,8,128,16,512,16,mslk,11.44,0,0.1935,17.97,1158.24,11.44,13.57
++gfx950,256,64,8,128,16,512,32,aiter,15.04,0,0.2317,27.05,1743.35,17.03,15.04
++gfx950,256,64,8,128,16,512,64,aiter,22.63,0,0.3662,35.78,2306.04,30.43,22.63
++gfx950,256,64,8,128,16,512,128,aiter,36.39,0,0.3294,44.37,2859.84,61.19,36.39
++gfx950,256,64,8,128,16,512,256,aiter,65.49,0,0.239,49.25,3174.30,126.19,65.49
++gfx950,256,64,8,128,16,1024,1,mslk,8.14,0,0.1745,4.12,265.56,8.14,12.68
++gfx950,256,64,8,128,16,1024,2,mslk,8.36,0,0.1551,7.03,452.96,8.36,11.32
++gfx950,256,64,8,128,16,1024,4,mslk,9.80,0,0.1709,11.13,717.29,9.80,12.83
++gfx950,256,64,8,128,16,1024,8,mslk,10.91,0,0.1657,19.22,1238.97,10.91,13.33
++gfx950,256,64,8,128,16,1024,16,mslk,13.89,0,0.3037,29.60,1907.88,13.89,14.64
++gfx950,256,64,8,128,16,1024,32,aiter,24.49,0,0.2687,33.23,2141.47,25.50,24.49
++gfx950,256,64,8,128,16,1024,64,aiter,34.01,0,0.235,47.60,3067.91,45.41,34.01
++gfx950,256,64,8,128,16,1024,128,aiter,62.79,0,0.2867,51.43,3315.06,84.73,62.79
++gfx950,256,64,8,128,16,1024,256,aiter,102.75,0,0.2527,62.78,4046.57,175.48,102.75
++gfx950,256,64,8,128,16,2048,1,mslk,8.76,0,0.1672,7.66,493.61,8.76,14.41
++gfx950,256,64,8,128,16,2048,2,mslk,9.81,0,0.1694,11.97,771.59,9.81,13.01
++gfx950,256,64,8,128,16,2048,4,mslk,10.54,0,0.1776,20.69,1333.77,10.54,13.49
++gfx950,256,64,8,128,16,2048,8,mslk,13.42,0,0.1612,31.25,2014.19,13.42,14.98
++gfx950,256,64,8,128,16,2048,16,aiter,21.32,0,0.1851,38.56,2485.05,23.52,21.32
++gfx950,256,64,8,128,16,2048,32,mslk,40.59,0,0.1907,40.09,2584.14,40.59,39.61
++gfx950,256,64,8,128,16,2048,64,aiter,59.45,0,0.2144,54.47,3510.64,71.65,59.45
++gfx950,256,64,8,128,16,2048,128,aiter,103.91,0,0.3157,62.16,4006.55,137.59,103.91
++gfx950,256,64,8,128,16,2048,256,aiter,195.45,0,0.2526,66.01,4254.56,253.20,195.45
++gfx950,256,64,8,128,16,4096,1,mslk,12.74,0,0.1451,10.53,678.94,12.74,17.14
++gfx950,256,64,8,128,16,4096,2,mslk,13.09,0,0.1427,17.94,1156.21,13.09,14.26
++gfx950,256,64,8,128,16,4096,4,mslk,14.73,0,0.1606,29.61,1908.59,14.73,15.82
++gfx950,256,64,8,128,16,4096,8,mslk,19.26,0,0.163,43.55,2807.04,19.26,22.40
++gfx950,256,64,8,128,16,4096,16,aiter,33.12,0,0.1818,49.64,3199.22,34.25,33.12
++gfx950,256,64,8,128,16,4096,32,mslk,59.59,0,0.1887,54.62,3520.21,59.59,66.28
++gfx950,256,64,8,128,16,4096,64,aiter,101.19,0,0.1859,64.00,4125.04,115.57,101.19
++gfx950,256,64,8,128,16,4096,128,mslk,204.56,0,0.26,63.15,4070.33,204.56,205.89
++gfx950,256,64,8,128,16,4096,256,aiter,342.06,0,0.235,75.44,4862.05,417.40,342.06
++gfx950,256,64,8,128,16,8192,1,mslk,19.09,0,0.1449,14.06,906.47,19.09,21.45
++gfx950,256,64,8,128,16,8192,2,aiter,15.92,0,0.1493,29.51,1901.86,19.67,15.92
++gfx950,256,64,8,128,16,8192,4,mslk,23.25,0,0.1614,37.52,2418.10,23.25,22.64
++gfx950,256,64,8,128,16,8192,8,mslk,31.81,0,0.1776,52.74,3398.99,31.81,34.45
++gfx950,256,64,8,128,16,8192,16,mslk,55.59,0,0.1611,59.16,3812.84,55.59,57.65
++gfx950,256,64,8,128,16,8192,32,mslk,103.57,0,0.2113,62.85,4050.81,103.57,116.27
++gfx950,256,64,8,128,16,8192,64,mslk,191.53,0,0.1933,67.62,4358.51,191.53,199.21
++gfx950,256,64,8,128,16,8192,128,mslk,370.28,0,0.1971,69.78,4497.35,370.28,366.32
++gfx950,256,64,8,128,16,8192,256,aiter,656.97,0,0.2145,78.55,5062.98,706.78,656.97
++gfx950,256,64,8,128,16,16384,1,aiter,23.90,0,0.1416,22.46,1447.78,31.80,23.90
++gfx950,256,64,8,128,16,16384,2,aiter,23.90,0,0.1314,39.31,2533.67,33.11,23.90
++gfx950,256,64,8,128,16,16384,4,aiter,34.38,0,0.151,50.75,3270.90,40.04,34.38
++gfx950,256,64,8,128,16,16384,8,mslk,52.18,0,0.1795,64.30,4144.52,52.18,59.00
++gfx950,256,64,8,128,16,16384,16,mslk,101.57,0,0.166,64.75,4173.42,101.57,101.04
++gfx950,256,64,8,128,16,16384,32,mslk,185.03,0,0.2038,70.36,4535.15,185.03,224.06
++gfx950,256,64,8,128,16,16384,64,mslk,340.89,0,0.187,75.99,4897.68,340.89,363.02
++gfx950,256,64,8,128,16,16384,128,mslk,657.33,0,0.2141,78.61,5066.75,657.33,728.25
++gfx950,256,64,8,128,16,16384,256,aiter,1262.81,0,0.2286,81.73,5267.95,1311.99,1262.81
++gfx950,256,64,8,128,16,32768,1,aiter,31.32,0,0.152,34.29,2209.83,57.25,31.32
++gfx950,256,64,8,128,16,32768,2,aiter,36.62,0,0.151,51.32,3307.58,58.24,36.62
++gfx950,256,64,8,128,16,32768,4,aiter,56.30,0,0.1655,61.99,3995.36,69.72,56.30
++gfx950,256,64,8,128,16,32768,8,mslk,98.70,0,0.1677,67.99,4382.18,98.70,100.79
++gfx950,256,64,8,128,16,32768,16,mslk,180.74,0,0.1744,72.78,4690.59,180.74,194.12
++gfx950,256,64,8,128,16,32768,32,mslk,334.29,0,0.2177,77.89,5020.30,334.29,402.77
++gfx950,256,64,8,128,16,32768,64,mslk,642.44,0,0.1807,80.64,5197.63,642.44,721.32
++gfx950,256,64,8,128,16,32768,128,mslk,1239.79,0,0.201,83.36,5372.74,1239.79,1408.94
++gfx950,256,64,8,128,16,65536,1,aiter,45.05,0,0.1525,47.67,3072.39,107.08,45.05
++gfx950,256,64,8,128,16,65536,2,aiter,61.33,0,0.1435,61.27,3949.20,108.47,61.33
++gfx950,256,64,8,128,16,65536,4,aiter,102.15,0,0.1582,68.32,4403.64,127.16,102.15
++gfx950,256,64,8,128,16,65536,8,mslk,183.94,0,0.1716,72.97,4703.06,183.94,188.29
++gfx950,256,64,8,128,16,65536,16,mslk,354.21,0,0.1745,74.27,4786.89,354.21,375.26
++gfx950,256,64,8,128,16,65536,32,mslk,660.40,0,0.1741,78.86,5082.54,660.40,803.45
++gfx950,256,64,8,128,16,65536,64,mslk,1280.58,0,0.1753,80.91,5215.12,1280.58,1433.07
++gfx950,256,64,8,128,16,131072,1,aiter,72.70,0,0.1498,59.08,3807.86,205.91,72.70
++gfx950,256,64,8,128,16,131072,2,aiter,107.12,0,0.162,70.17,4522.42,208.36,107.12
++gfx950,256,64,8,128,16,131072,4,aiter,186.83,0,0.1611,74.71,4815.54,239.88,186.83
++gfx950,256,64,8,128,16,131072,8,mslk,338.75,0,0.2007,79.24,5107.52,338.75,344.20
++gfx950,256,64,8,128,16,131072,16,mslk,694.34,0,0.1724,75.78,4883.95,694.34,711.81
++gfx950,256,64,8,128,16,131072,32,mslk,1277.49,0,0.1786,81.53,5254.83,1277.49,1571.34
++gfx950,256,64,8,128,64,256,1,mslk,7.82,0,0.1372,1.07,69.13,7.82,11.85
++gfx950,256,64,8,128,64,256,2,mslk,8.00,0,0.2547,1.83,118.25,8.00,11.30
++gfx950,256,64,8,128,64,256,4,mslk,8.09,0,0.165,3.37,217.27,8.09,11.36
++gfx950,256,64,8,128,64,256,8,mslk,9.58,0,0.2038,5.47,352.67,9.58,12.75
++gfx950,256,64,8,128,64,256,16,mslk,9.86,0,0.2005,10.42,671.51,9.86,14.22
++gfx950,256,64,8,128,64,256,32,mslk,11.35,0,0.2203,17.92,1154.95,11.35,14.95
++gfx950,256,64,8,128,64,256,64,mslk,17.54,0,0.2103,23.08,1487.49,17.54,17.22
++gfx950,256,64,8,128,64,256,128,aiter,23.83,0,0.3137,33.88,2183.54,34.13,23.83
++gfx950,256,64,8,128,64,256,256,aiter,40.45,0,0.2412,39.92,2572.86,67.70,40.45
++gfx950,256,64,8,128,64,512,1,mslk,8.10,0,0.1354,2.07,133.42,8.10,12.39
++gfx950,256,64,8,128,64,512,2,mslk,8.09,0,0.1358,3.63,233.94,8.09,11.34
++gfx950,256,64,8,128,64,512,4,mslk,8.44,0,0.1709,6.46,416.63,8.44,12.00
++gfx950,256,64,8,128,64,512,8,mslk,10.02,0,0.2246,10.46,674.27,10.02,13.99
++gfx950,256,64,8,128,64,512,16,mslk,10.56,0,0.2495,19.46,1254.15,10.56,14.45
++gfx950,256,64,8,128,64,512,32,mslk,13.93,0,0.176,29.21,1882.51,13.93,16.28
++gfx950,256,64,8,128,64,512,64,aiter,23.17,0,0.257,34.94,2251.98,25.92,23.17
++gfx950,256,64,8,128,64,512,128,aiter,34.06,0,0.3083,47.41,3055.57,48.04,34.06
++gfx950,256,64,8,128,64,512,256,aiter,65.42,0,0.2559,49.30,3177.61,88.98,65.42
++gfx950,256,64,8,128,64,1024,1,mslk,7.96,0,0.1488,4.21,271.62,7.96,13.09
++gfx950,256,64,8,128,64,1024,2,mslk,8.22,0,0.1636,7.14,460.35,8.22,11.70
++gfx950,256,64,8,128,64,1024,4,mslk,9.62,0,0.2122,11.34,730.82,9.62,13.76
++gfx950,256,64,8,128,64,1024,8,mslk,10.71,0,0.1605,19.59,1262.58,10.71,14.27
++gfx950,256,64,8,128,64,1024,16,mslk,12.88,0,0.226,31.92,2057.32,12.88,16.05
++gfx950,256,64,8,128,64,1024,32,mslk,23.68,0,0.1913,34.36,2214.48,23.68,25.95
++gfx950,256,64,8,128,64,1024,64,aiter,35.15,0,0.285,46.07,2969.08,40.70,35.15
++gfx950,256,64,8,128,64,1024,128,aiter,59.07,0,0.2845,54.68,3524.22,70.57,59.07
++gfx950,256,64,8,128,64,1024,256,aiter,102.99,0,0.3315,62.63,4036.90,138.00,102.99
++gfx950,256,64,8,128,64,2048,1,mslk,8.58,0,0.1355,7.82,503.91,8.58,15.44
++gfx950,256,64,8,128,64,2048,2,mslk,9.64,0,0.1576,12.18,785.21,9.64,14.04
++gfx950,256,64,8,128,64,2048,4,mslk,10.34,0,0.1466,21.09,1359.34,10.34,14.44
++gfx950,256,64,8,128,64,2048,8,mslk,13.11,0,0.2014,31.98,2061.48,13.11,15.97
++gfx950,256,64,8,128,64,2048,16,mslk,18.41,0,0.186,44.66,2878.60,18.41,22.81
++gfx950,256,64,8,128,64,2048,32,mslk,34.19,0,0.2083,47.60,3067.94,34.19,40.17
++gfx950,256,64,8,128,64,2048,64,mslk,59.06,0,0.1972,54.82,3533.47,59.06,59.78
++gfx950,256,64,8,128,64,2048,128,aiter,97.20,0,0.2344,66.45,4283.19,112.47,97.20
++gfx950,256,64,8,128,64,2048,256,aiter,190.00,0,0.2966,67.90,4376.51,202.31,190.00
++gfx950,256,64,8,128,64,4096,1,mslk,12.00,0,0.1667,11.18,720.79,12.00,18.16
++gfx950,256,64,8,128,64,4096,2,mslk,12.52,0,0.1495,18.77,1209.64,12.52,15.21
++gfx950,256,64,8,128,64,4096,4,mslk,14.06,0,0.1545,31.02,1999.04,14.06,16.71
++gfx950,256,64,8,128,64,4096,8,mslk,18.68,0,0.1784,44.92,2895.12,18.68,23.62
++gfx950,256,64,8,128,64,4096,16,mslk,29.70,0,0.1955,55.36,3568.41,29.70,34.07
++gfx950,256,64,8,128,64,4096,32,mslk,54.70,0,0.1745,59.51,3835.33,54.70,64.99
++gfx950,256,64,8,128,64,4096,64,mslk,101.23,0,0.2205,63.97,4123.38,101.23,100.07
++gfx950,256,64,8,128,64,4096,128,mslk,181.73,0,0.2315,71.09,4581.72,181.73,195.00
++gfx950,256,64,8,128,64,4096,256,aiter,341.56,0,0.236,75.55,4869.18,366.92,341.56
++gfx950,256,64,8,128,64,8192,1,mslk,17.33,0,0.1561,15.49,998.14,17.33,22.51
++gfx950,256,64,8,128,64,8192,2,aiter,16.98,0,0.1415,27.66,1782.87,18.27,16.98
++gfx950,256,64,8,128,64,8192,4,mslk,21.89,0,0.2201,39.85,2568.45,21.89,23.68
++gfx950,256,64,8,128,64,8192,8,mslk,30.02,0,0.1572,55.88,3601.66,30.02,35.30
++gfx950,256,64,8,128,64,8192,16,mslk,51.54,0,0.2098,63.81,4112.53,51.54,58.83
++gfx950,256,64,8,128,64,8192,32,mslk,95.35,0,0.2085,68.27,4400.08,95.35,111.65
++gfx950,256,64,8,128,64,8192,64,mslk,181.61,0,0.2277,71.32,4596.56,181.61,195.94
++gfx950,256,64,8,128,64,8192,128,mslk,344.27,0,0.1894,75.05,4837.13,344.27,352.68
++gfx950,256,64,8,128,64,8192,256,mslk,646.88,0,0.1955,79.78,5141.93,646.88,645.21
++gfx950,256,64,8,128,64,16384,1,aiter,24.85,0,0.1637,21.60,1392.21,28.12,24.85
++gfx950,256,64,8,128,64,16384,2,aiter,24.86,0,0.1337,37.79,2435.93,29.73,24.86
++gfx950,256,64,8,128,64,16384,4,mslk,36.29,0,0.1697,48.08,3099.03,36.29,35.28
++gfx950,256,64,8,128,64,16384,8,mslk,51.24,0,0.1697,65.49,4220.93,51.24,57.29
++gfx950,256,64,8,128,64,16384,16,mslk,95.78,0,0.1834,68.66,4425.43,95.78,101.28
++gfx950,256,64,8,128,64,16384,32,mslk,182.67,0,0.1954,71.27,4593.54,182.67,220.12
++gfx950,256,64,8,128,64,16384,64,mslk,339.00,0,0.1985,76.41,4925.02,339.00,361.24
++gfx950,256,64,8,128,64,16384,128,mslk,635.31,0,0.2193,81.34,5242.35,635.31,684.30
++gfx950,256,64,8,128,64,16384,256,mslk,1232.07,0,0.2345,83.77,5399.39,1232.07,1246.25
++gfx950,256,64,8,128,64,32768,1,aiter,31.72,0,0.1602,33.85,2181.72,49.40,31.72
++gfx950,256,64,8,128,64,32768,2,aiter,37.06,0,0.1247,50.71,3268.16,51.90,37.06
++gfx950,256,64,8,128,64,32768,4,aiter,55.18,0,0.186,63.24,4075.74,63.09,55.18
++gfx950,256,64,8,128,64,32768,8,mslk,95.14,0,0.1711,70.54,4546.42,95.14,98.56
++gfx950,256,64,8,128,64,32768,16,mslk,177.53,0,0.1693,74.09,4775.32,177.53,191.89
++gfx950,256,64,8,128,64,32768,32,mslk,348.83,0,0.1879,74.64,4811.10,348.83,413.12
++gfx950,256,64,8,128,64,32768,64,mslk,651.31,0,0.1879,79.54,5126.88,651.31,708.26
++gfx950,256,64,8,128,64,32768,128,mslk,1242.20,0,0.1988,83.20,5362.33,1242.20,1432.32
++gfx950,256,64,8,128,64,65536,1,aiter,45.13,0,0.169,47.59,3067.12,91.44,45.13
++gfx950,256,64,8,128,64,65536,2,aiter,60.53,0,0.1528,62.09,4001.79,95.44,60.53
++gfx950,256,64,8,128,64,65536,4,aiter,96.99,0,0.161,71.96,4638.04,113.93,96.99
++gfx950,256,64,8,128,64,65536,8,mslk,180.85,0,0.1666,74.21,4783.37,180.85,181.09
++gfx950,256,64,8,128,64,65536,16,mslk,342.43,0,0.1819,76.82,4951.49,342.43,366.65
++gfx950,256,64,8,128,64,65536,32,mslk,658.78,0,0.2071,79.05,5095.01,658.78,799.81
++gfx950,256,64,8,128,64,65536,64,mslk,1240.78,0,0.1932,83.51,5382.41,1240.78,1351.27
++gfx950,256,64,8,128,64,131072,1,aiter,72.68,0,0.154,59.10,3808.87,177.31,72.68
++gfx950,256,64,8,128,64,131072,2,aiter,104.51,0,0.1556,71.92,4635.56,181.23,104.51
++gfx950,256,64,8,128,64,131072,4,aiter,184.09,0,0.1544,75.83,4887.26,222.30,184.09
++gfx950,256,64,8,128,64,131072,8,mslk,347.00,0,0.1618,77.36,4986.07,347.00,340.62
++gfx950,256,64,8,128,64,131072,16,mslk,670.23,0,0.1767,78.50,5059.57,670.23,714.34
++gfx950,256,64,8,128,64,131072,32,mslk,1350.07,0,0.1933,77.15,4972.31,1350.07,1622.66
++gfx950,256,128,8,128,16,256,1,mslk,8.95,0,0.1684,1.88,60.43,8.95,11.23
++gfx950,256,128,8,128,16,256,2,mslk,9.09,0,0.2167,3.23,104.13,9.09,10.45
++gfx950,256,128,8,128,16,256,4,mslk,9.13,0,0.2351,5.97,192.38,9.13,10.69
++gfx950,256,128,8,128,16,256,8,mslk,10.91,0,0.2725,9.61,309.66,10.91,11.75
++gfx950,256,128,8,128,16,256,16,mslk,11.65,0,0.1856,17.64,568.60,11.65,12.47
++gfx950,256,128,8,128,16,256,32,aiter,13.73,0,0.2258,29.62,954.64,16.46,13.73
++gfx950,256,128,8,128,16,256,64,aiter,16.83,0,0.2211,48.11,1550.47,26.16,16.83
++gfx950,256,128,8,128,16,256,128,aiter,28.16,0,0.2939,57.35,1848.28,50.41,28.16
++gfx950,256,128,8,128,16,256,256,aiter,45.23,0,0.3035,71.40,2301.04,107.29,45.23
++gfx950,256,128,8,128,16,512,1,mslk,9.12,0,0.1548,3.68,118.52,9.12,11.82
++gfx950,256,128,8,128,16,512,2,mslk,9.14,0,0.1396,6.42,207.00,9.14,10.54
++gfx950,256,128,8,128,16,512,4,mslk,9.81,0,0.1934,11.12,358.41,9.81,11.14
++gfx950,256,128,8,128,16,512,8,mslk,11.20,0,0.2448,18.72,603.21,11.20,12.71
++gfx950,256,128,8,128,16,512,16,mslk,12.75,0,0.2118,32.23,1038.75,12.75,13.48
++gfx950,256,128,8,128,16,512,32,aiter,15.49,0,0.2056,52.54,1693.13,19.40,15.49
++gfx950,256,128,8,128,16,512,64,aiter,24.19,0,0.2226,66.93,2157.03,34.06,24.19
++gfx950,256,128,8,128,16,512,128,aiter,40.57,0,0.3007,79.60,2565.35,70.07,40.57
++gfx950,256,128,8,128,16,512,256,aiter,74.22,0,0.2844,86.91,2800.80,139.45,74.22
++gfx950,256,128,8,128,16,1024,1,mslk,9.09,0,0.1481,7.38,237.98,9.09,12.23
++gfx950,256,128,8,128,16,1024,2,mslk,10.08,0,0.1803,11.65,375.44,10.08,11.43
++gfx950,256,128,8,128,16,1024,4,mslk,10.71,0,0.1779,20.37,656.36,10.71,12.68
++gfx950,256,128,8,128,16,1024,8,mslk,11.95,0,0.2413,35.10,1131.06,11.95,13.19
++gfx950,256,128,8,128,16,1024,16,aiter,14.78,0,0.234,55.63,1792.70,15.29,14.78
++gfx950,256,128,8,128,16,1024,32,aiter,24.98,0,0.1945,65.16,2099.80,27.80,24.98
++gfx950,256,128,8,128,16,1024,64,aiter,34.88,0,0.2298,92.83,2991.49,48.60,34.88
++gfx950,256,128,8,128,16,1024,128,aiter,64.89,0,0.2596,99.54,3207.90,91.19,64.89
++gfx950,256,128,8,128,16,1024,256,aiter,115.33,0,0.2781,111.87,3605.22,189.93,115.33
++gfx950,256,128,8,128,16,2048,1,mslk,9.79,0,0.1398,13.70,441.66,9.79,14.51
++gfx950,256,128,8,128,16,2048,2,mslk,10.75,0,0.1626,21.85,704.29,10.75,12.77
++gfx950,256,128,8,128,16,2048,4,mslk,11.48,0,0.2847,38.01,1224.78,11.48,13.26
++gfx950,256,128,8,128,16,2048,8,mslk,14.35,0,0.1716,58.44,1883.40,14.35,14.59
++gfx950,256,128,8,128,16,2048,16,aiter,21.27,0,0.2439,77.31,2491.43,24.98,21.27
++gfx950,256,128,8,128,16,2048,32,aiter,39.61,0,0.1866,82.17,2648.18,42.66,39.61
++gfx950,256,128,8,128,16,2048,64,aiter,61.32,0,0.2595,105.61,3403.51,75.52,61.32
++gfx950,256,128,8,128,16,2048,128,aiter,105.93,0,0.2853,121.95,3929.99,144.91,105.93
++gfx950,256,128,8,128,16,2048,256,aiter,205.09,0,0.2626,125.82,4054.59,266.09,205.09
++gfx950,256,128,8,128,16,4096,1,mslk,13.64,0,0.1521,19.67,634.04,13.64,17.00
++gfx950,256,128,8,128,16,4096,2,mslk,14.01,0,0.1486,33.54,1080.84,14.01,14.06
++gfx950,256,128,8,128,16,4096,4,mslk,15.76,0,0.1882,55.37,1784.36,15.76,15.54
++gfx950,256,128,8,128,16,4096,8,mslk,20.69,0,0.1773,81.10,2613.62,20.69,22.15
++gfx950,256,128,8,128,16,4096,16,aiter,33.01,0,0.1988,99.63,3210.66,35.71,33.01
++gfx950,256,128,8,128,16,4096,32,mslk,61.71,0,0.1917,105.49,3399.70,61.71,66.45
++gfx950,256,128,8,128,16,4096,64,aiter,104.82,0,0.219,123.57,3982.21,120.53,104.82
++gfx950,256,128,8,128,16,4096,128,mslk,217.17,0,0.2364,118.97,3834.10,217.17,212.19
++gfx950,256,128,8,128,16,4096,256,aiter,353.92,0,0.2545,145.81,4699.05,441.94,353.92
++gfx950,256,128,8,128,16,8192,1,mslk,20.01,0,0.1485,26.83,864.64,20.01,21.36
++gfx950,256,128,8,128,16,8192,2,aiter,15.36,0,0.1574,61.17,1971.32,20.55,15.36
++gfx950,256,128,8,128,16,8192,4,aiter,22.31,0,0.1712,78.20,2520.03,24.26,22.31
++gfx950,256,128,8,128,16,8192,8,mslk,33.38,0,0.1879,100.51,3239.03,33.38,33.98
++gfx950,256,128,8,128,16,8192,16,mslk,56.64,0,0.2183,116.11,3741.88,56.64,58.24
++gfx950,256,128,8,128,16,8192,32,mslk,104.72,0,0.2043,124.33,4006.59,104.72,117.78
++gfx950,256,128,8,128,16,8192,64,mslk,198.93,0,0.2162,130.22,4196.43,198.93,202.09
++gfx950,256,128,8,128,16,8192,128,mslk,386.13,0,0.2298,133.82,4312.66,386.13,380.98
++gfx950,256,128,8,128,16,8192,256,aiter,678.50,0,0.2797,152.12,4902.31,757.11,678.50
++gfx950,256,128,8,128,16,16384,1,aiter,23.90,0,0.1463,44.92,1447.72,32.74,23.90
++gfx950,256,128,8,128,16,16384,2,aiter,23.43,0,0.1436,80.20,2584.65,34.08,23.43
++gfx950,256,128,8,128,16,16384,4,aiter,34.13,0,0.1773,102.23,3294.57,40.87,34.13
++gfx950,256,128,8,128,16,16384,8,mslk,52.64,0,0.1834,127.48,4108.21,52.64,58.93
++gfx950,256,128,8,128,16,16384,16,mslk,103.62,0,0.1696,126.93,4090.62,103.62,102.04
++gfx950,256,128,8,128,16,16384,32,mslk,176.52,0,0.2077,147.51,4753.74,176.52,219.55
++gfx950,256,128,8,128,16,16384,64,mslk,351.57,0,0.1972,147.36,4748.94,351.57,369.28
++gfx950,256,128,8,128,16,16384,128,mslk,670.96,0,0.2204,154.03,4963.86,670.96,731.52
++gfx950,256,128,8,128,16,16384,256,mslk,1310.44,0,0.2149,157.52,5076.47,1310.44,1282.79
++gfx950,256,128,8,128,16,32768,1,aiter,30.75,0,0.1364,69.83,2250.48,57.93,30.75
++gfx950,256,128,8,128,16,32768,2,aiter,36.45,0,0.1635,103.11,3322.82,59.66,36.45
++gfx950,256,128,8,128,16,32768,4,aiter,55.96,0,0.1586,124.71,4018.99,70.34,55.96
++gfx950,256,128,8,128,16,32768,8,mslk,97.16,0,0.1695,138.14,4451.63,97.16,102.35
++gfx950,256,128,8,128,16,32768,16,mslk,192.92,0,0.1789,136.36,4394.35,192.92,198.65
++gfx950,256,128,8,128,16,32768,32,mslk,343.88,0,0.2257,151.44,4880.30,343.88,409.02
++gfx950,256,128,8,128,16,32768,64,mslk,657.58,0,0.2208,157.57,5077.96,657.58,732.43
++gfx950,256,128,8,128,16,32768,128,mslk,1278.73,0,0.2383,161.64,5209.13,1278.73,1422.98
++gfx950,256,128,8,128,16,65536,1,aiter,44.70,0,0.1482,96.08,3096.47,107.90,44.70
++gfx950,256,128,8,128,16,65536,2,aiter,62.40,0,0.156,120.46,3882.01,109.58,62.40
++gfx950,256,128,8,128,16,65536,4,aiter,101.95,0,0.1586,136.91,4412.28,127.48,101.95
++gfx950,256,128,8,128,16,65536,8,mslk,189.39,0,0.1853,141.74,4567.66,189.39,191.36
++gfx950,256,128,8,128,16,65536,16,mslk,355.89,0,0.1936,147.84,4764.27,355.89,371.45
++gfx950,256,128,8,128,16,65536,32,mslk,670.43,0,0.188,155.35,5006.51,670.43,808.66
++gfx950,256,128,8,128,16,65536,64,mslk,1253.92,0,0.1866,165.27,5326.00,1253.92,1413.33
++gfx950,256,128,8,128,16,131072,1,aiter,74.34,0,0.1487,115.55,3723.68,207.58,74.34
++gfx950,256,128,8,128,16,131072,2,aiter,108.56,0,0.196,138.46,4462.25,207.12,108.56
++gfx950,256,128,8,128,16,131072,4,aiter,189.74,0,0.18,147.13,4741.59,239.91,189.74
++gfx950,256,128,8,128,16,131072,8,mslk,353.98,0,0.1681,151.67,4887.71,353.98,366.62
++gfx950,256,128,8,128,16,131072,16,mslk,704.72,0,0.1763,149.32,4811.96,704.72,724.96
++gfx950,256,128,8,128,16,131072,32,mslk,1316.05,0,0.1994,158.28,5100.87,1316.05,1633.03
++gfx950,256,128,8,128,64,256,1,mslk,8.77,0,0.181,1.91,61.65,8.77,11.75
++gfx950,256,128,8,128,64,256,2,mslk,8.93,0,0.1677,3.29,106.01,8.93,11.13
++gfx950,256,128,8,128,64,256,4,mslk,8.98,0,0.1894,6.07,195.65,8.98,11.34
++gfx950,256,128,8,128,64,256,8,mslk,10.81,0,0.1873,9.70,312.46,10.81,12.87
++gfx950,256,128,8,128,64,256,16,mslk,10.88,0,0.2735,18.90,609.00,10.88,14.05
++gfx950,256,128,8,128,64,256,32,mslk,12.84,0,0.2312,31.68,1020.80,12.84,15.08
++gfx950,256,128,8,128,64,256,64,aiter,18.45,0,0.2109,43.89,1414.33,19.92,18.45
++gfx950,256,128,8,128,64,256,128,aiter,28.31,0,0.2835,57.03,1837.94,38.19,28.31
++gfx950,256,128,8,128,64,256,256,aiter,47.05,0,0.3003,68.65,2212.19,74.78,47.05
++gfx950,256,128,8,128,64,512,1,mslk,8.97,0,0.1457,3.74,120.61,8.97,12.41
++gfx950,256,128,8,128,64,512,2,mslk,8.97,0,0.1727,6.54,210.91,8.97,11.14
++gfx950,256,128,8,128,64,512,4,mslk,10.08,0,0.1734,10.82,348.80,10.08,11.83
++gfx950,256,128,8,128,64,512,8,mslk,11.07,0,0.1807,18.94,610.34,11.07,13.77
++gfx950,256,128,8,128,64,512,16,mslk,11.68,0,0.2169,35.20,1134.37,11.68,14.64
++gfx950,256,128,8,128,64,512,32,mslk,15.43,0,0.2155,52.75,1699.80,15.43,16.90
++gfx950,256,128,8,128,64,512,64,aiter,24.47,0,0.2389,66.15,2131.92,28.32,24.47
++gfx950,256,128,8,128,64,512,128,aiter,38.35,0,0.239,84.22,2714.11,53.05,38.35
++gfx950,256,128,8,128,64,512,256,aiter,73.58,0,0.3203,87.67,2825.15,98.93,73.58
++gfx950,256,128,8,128,64,1024,1,mslk,8.85,0,0.1612,7.58,244.37,8.85,12.92
++gfx950,256,128,8,128,64,1024,2,mslk,9.49,0,0.1904,12.38,398.97,9.49,12.05
++gfx950,256,128,8,128,64,1024,4,mslk,10.56,0,0.1541,20.66,665.90,10.56,13.67
++gfx950,256,128,8,128,64,1024,8,mslk,11.83,0,0.1889,35.46,1142.89,11.83,14.20
++gfx950,256,128,8,128,64,1024,16,mslk,14.06,0,0.2095,58.46,1883.86,14.06,15.79
++gfx950,256,128,8,128,64,1024,32,mslk,25.26,0,0.2152,64.42,2076.09,25.26,26.71
++gfx950,256,128,8,128,64,1024,64,aiter,36.02,0,0.2583,89.90,2897.26,42.72,36.02
++gfx950,256,128,8,128,64,1024,128,aiter,62.50,0,0.2239,103.35,3330.68,74.56,62.50
++gfx950,256,128,8,128,64,1024,256,aiter,113.37,0,0.4829,113.80,3667.40,148.62,113.37
++gfx950,256,128,8,128,64,2048,1,mslk,9.56,0,0.1561,14.03,452.23,9.56,15.36
++gfx950,256,128,8,128,64,2048,2,mslk,10.53,0,0.1629,22.30,718.75,10.53,13.75
++gfx950,256,128,8,128,64,2048,4,mslk,11.33,0,0.1892,38.51,1241.12,11.33,14.41
++gfx950,256,128,8,128,64,2048,8,mslk,14.41,0,0.2119,58.22,1876.38,14.41,16.13
++gfx950,256,128,8,128,64,2048,16,mslk,19.31,0,0.1791,85.13,2743.49,19.31,22.33
++gfx950,256,128,8,128,64,2048,32,mslk,36.10,0,0.2069,90.17,2905.92,36.10,41.24
++gfx950,256,128,8,128,64,2048,64,mslk,61.61,0,0.2296,105.12,3387.61,61.61,61.00
++gfx950,256,128,8,128,64,2048,128,aiter,106.09,0,0.2955,121.77,3924.35,119.64,106.09
++gfx950,256,128,8,128,64,2048,256,aiter,200.32,0,0.2711,128.81,4151.20,222.99,200.32
++gfx950,256,128,8,128,64,4096,1,mslk,12.99,0,0.1679,20.67,665.98,12.99,18.22
++gfx950,256,128,8,128,64,4096,2,mslk,13.41,0,0.1415,35.04,1129.09,13.41,15.20
++gfx950,256,128,8,128,64,4096,4,mslk,15.13,0,0.1621,57.67,1858.63,15.13,16.76
++gfx950,256,128,8,128,64,4096,8,mslk,19.66,0,0.1737,85.32,2749.42,19.66,22.98
++gfx950,256,128,8,128,64,4096,16,mslk,31.68,0,0.1871,103.79,3344.69,31.68,33.98
++gfx950,256,128,8,128,64,4096,32,mslk,55.70,0,0.1889,116.86,3766.14,55.70,66.49
++gfx950,256,128,8,128,64,4096,64,mslk,104.05,0,0.2199,124.47,4011.33,104.05,102.43
++gfx950,256,128,8,128,64,4096,128,mslk,191.23,0,0.2251,135.11,4354.12,191.23,199.11
++gfx950,256,128,8,128,64,4096,256,aiter,356.94,0,0.2498,144.58,4659.35,393.52,356.94
++gfx950,256,128,8,128,64,8192,1,mslk,18.22,0,0.1368,29.47,949.60,18.22,22.44
++gfx950,256,128,8,128,64,8192,2,aiter,16.61,0,0.1771,56.57,1822.98,19.13,16.61
++gfx950,256,128,8,128,64,8192,4,mslk,22.75,0,0.1533,76.71,2472.08,22.75,23.79
++gfx950,256,128,8,128,64,8192,8,mslk,31.41,0,0.179,106.83,3442.79,31.41,34.96
++gfx950,256,128,8,128,64,8192,16,mslk,53.14,0,0.1883,123.77,3988.52,53.14,58.47
++gfx950,256,128,8,128,64,8192,32,mslk,97.92,0,0.1764,132.96,4284.73,97.92,114.67
++gfx950,256,128,8,128,64,8192,64,mslk,188.21,0,0.3382,137.64,4435.50,188.21,200.77
++gfx950,256,128,8,128,64,8192,128,mslk,355.45,0,0.2119,145.38,4684.99,355.45,355.70
++gfx950,256,128,8,128,64,8192,256,mslk,653.13,0,0.2544,158.03,5092.72,653.13,655.10
++gfx950,256,128,8,128,64,16384,1,aiter,25.07,0,0.1419,42.83,1380.32,29.15,25.07
++gfx950,256,128,8,128,64,16384,2,aiter,24.03,0,0.1619,78.19,2519.69,30.24,24.03
++gfx950,256,128,8,128,64,16384,4,aiter,35.48,0,0.1621,98.36,3169.70,36.98,35.48
++gfx950,256,128,8,128,64,16384,8,mslk,53.42,0,0.1868,125.63,4048.65,53.42,58.22
++gfx950,256,128,8,128,64,16384,16,mslk,94.43,0,0.1839,139.29,4488.89,94.43,99.77
++gfx950,256,128,8,128,64,16384,32,mslk,186.23,0,0.1882,139.82,4505.76,186.23,227.59
++gfx950,256,128,8,128,64,16384,64,mslk,338.00,0,0.2025,153.28,4939.67,338.00,368.89
++gfx950,256,128,8,128,64,16384,128,mslk,648.59,0,0.2152,159.34,5135.09,648.59,687.44
++gfx950,256,128,8,128,64,16384,256,mslk,1260.60,0,0.228,163.75,5277.19,1260.60,1251.77
++gfx950,256,128,8,128,64,32768,1,aiter,31.54,0,0.1834,68.08,2193.93,51.12,31.54
++gfx950,256,128,8,128,64,32768,2,aiter,36.43,0,0.1461,103.15,3324.32,52.54,36.43
++gfx950,256,128,8,128,64,32768,4,aiter,55.17,0,0.1526,126.50,4076.70,63.60,55.17
++gfx950,256,128,8,128,64,32768,8,mslk,96.83,0,0.1927,138.61,4467.06,96.83,99.33
++gfx950,256,128,8,128,64,32768,16,mslk,178.03,0,0.1791,147.77,4762.08,178.03,193.50
++gfx950,256,128,8,128,64,32768,32,mslk,349.92,0,0.2101,148.83,4796.14,349.92,422.26
++gfx950,256,128,8,128,64,32768,64,mslk,636.15,0,0.1908,162.88,5249.02,636.15,705.86
++gfx950,256,128,8,128,64,32768,128,mslk,1240.23,0,0.2046,166.66,5370.83,1240.23,1428.11
++gfx950,256,128,8,128,64,65536,1,aiter,44.88,0,0.1301,95.71,3084.33,93.18,44.88
++gfx950,256,128,8,128,64,65536,2,aiter,61.19,0,0.154,122.84,3958.67,96.89,61.19
++gfx950,256,128,8,128,64,65536,4,aiter,99.95,0,0.1834,139.65,4500.54,114.49,99.95
++gfx950,256,128,8,128,64,65536,8,mslk,181.59,0,0.1733,147.82,4763.77,181.59,180.47
++gfx950,256,128,8,128,64,65536,16,mslk,348.58,0,0.1791,150.94,4864.20,348.58,365.30
++gfx950,256,128,8,128,64,65536,32,mslk,661.73,0,0.1897,157.40,5072.31,661.73,794.15
++gfx950,256,128,8,128,64,65536,64,mslk,1295.77,0,0.1849,159.93,5154.00,1295.77,1402.26
++gfx950,256,128,8,128,64,131072,1,aiter,71.33,0,0.1499,120.43,3881.16,175.79,71.33
++gfx950,256,128,8,128,64,131072,2,aiter,104.79,0,0.1552,143.45,4622.88,182.17,104.79
++gfx950,256,128,8,128,64,131072,4,aiter,180.58,0,0.1851,154.60,4982.21,216.66,180.58
++gfx950,256,128,8,128,64,131072,8,mslk,351.50,0,0.1876,152.74,4922.24,351.50,349.88
++gfx950,256,128,8,128,64,131072,16,mslk,660.30,0,0.1803,159.36,5135.70,660.30,697.34
++gfx950,256,128,8,128,64,131072,32,mslk,1347.11,0,0.2187,154.63,4983.26,1347.11,1616.13
+diff --git a/mslk/attention/flydsl/decode/pa_decode_fp8_dispatch.py b/mslk/attention/flydsl/decode/pa_decode_fp8_dispatch.py
+index c52d150..8c67c99 100644
+--- a/mslk/attention/flydsl/decode/pa_decode_fp8_dispatch.py
++++ b/mslk/attention/flydsl/decode/pa_decode_fp8_dispatch.py
+@@ -126,14 +126,54 @@ def paged_attention_decode_fp8(
+     temporary_output: Optional[torch.Tensor] = None,
+     stream: Optional[object] = None,
+ ) -> str:
+-    """Run the FlyDSL native-fp8 paged decode (writes into `output`). Guarded wrapper
+-    around pa_decode_fp8.pa_decode_ps_launch; raises when FlyDSL/arch unavailable."""
++    """Run the native-fp8 paged decode (writes into `output`), by MSLK's FlyDSL
++    kernel or, for the shapes where it is faster, aiter's (see
++    mslk/attention/dispatch/paged_attention_decode_fp8.py). Raises when
++    FlyDSL/arch unavailable. The scratch arguments are used by MSLK's kernel only."""
+     require_flydsl()
+     if not is_fp8_paged_decode_available():
+         raise RuntimeError(
+             "FlyDSL native-fp8 paged decode requires gfx950 (CDNA4). "
+             "For the int32-packed Triton fp8 format, use triton_splitk.FwOp instead."
+         )
++    from mslk.attention.dispatch.paged_attention_decode_fp8 import ROUTING
++
++    return ROUTING(
++        output,
++        query,
++        key_cache,
++        value_cache,
++        context_lengths,
++        block_tables,
++        softmax_scale,
++        key_scale,
++        value_scale,
++        max_context_partition_num=max_context_partition_num,
++        exp_sums=exp_sums,
++        max_logits=max_logits,
++        temporary_output=temporary_output,
++        stream=stream,
++    )
++
++
++def paged_attention_decode_fp8_flydsl(
++    output: torch.Tensor,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    context_lengths: torch.Tensor,
++    block_tables: torch.Tensor,
++    softmax_scale: float,
++    key_scale: torch.Tensor,
++    value_scale: torch.Tensor,
++    *,
++    max_context_partition_num: int = 0,
++    exp_sums: Optional[torch.Tensor] = None,
++    max_logits: Optional[torch.Tensor] = None,
++    temporary_output: Optional[torch.Tensor] = None,
++    stream: Optional[object] = None,
++) -> str:
++    """MSLK's backend of paged_attention_decode_fp8: pa_decode_fp8.pa_decode_ps_launch."""
+     from .pa_decode_fp8 import pa_decode_ps_launch
+ 
+     return pa_decode_ps_launch(
+diff --git a/setup.py b/setup.py
+index 715c5d6..185f69b 100644
+--- a/setup.py
++++ b/setup.py
+@@ -810,6 +810,7 @@ def main(argv: List[str]) -> None:
+             "mslk.flydsl": ["aot_artifacts/*"],
+             "mslk.aiter": ["aiter_version.txt"],
+             "mslk.gemm.dispatch": ["tables/*.csv"],
++            "mslk.attention.dispatch": ["tables/*.csv"],
+         },
+         install_requires=[
+             # Only specify numpy, as specifying torch will auto-install the
+diff --git a/test/aiter/lazy_import_test.py b/test/aiter/lazy_import_test.py
+index 23cc58b..16bcba0 100644
+--- a/test/aiter/lazy_import_test.py
++++ b/test/aiter/lazy_import_test.py
+@@ -25,6 +25,9 @@ class LazyAiterImportTest(unittest.TestCase):
+             "mslk.aiter.routing",
+             "mslk.gemm.aiter.f4f4bf16",
+             "mslk.gemm.dispatch.f4f4bf16",
++            "mslk.attention.aiter.paged_attention_decode_fp8",
++            "mslk.attention.dispatch.paged_attention_decode_fp8",
++            "mslk.attention.flydsl.decode.pa_decode_fp8_dispatch",
+         ):
+             importlib.import_module(module)
+ 
+diff --git a/test/attention/dispatch_test.py b/test/attention/dispatch_test.py
+new file mode 100644
+index 0000000..a4dd6a3
+--- /dev/null
++++ b/test/attention/dispatch_test.py
+@@ -0,0 +1,109 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Each routed attention op serves its calls with the backend its tuning table
++names.
++
++End to end, on the GPU: for each op, the cheapest row of its table per backend
++is called through the op, and the test checks which backend served it. Adding
++a routed op means adding one entry to ``CASES``.
++"""
++
++import math
++import unittest
++from typing import Any, Callable, Dict, List, Tuple
++from unittest import mock
++
++import torch
++from mslk.aiter.common import is_aiter_enabled
++from mslk.aiter.routing import device_key, OpRouting
++from mslk.attention.dispatch import paged_attention_decode_fp8
++from mslk.attention.flydsl.decode.pa_decode_fp8_dispatch import (
++    is_fp8_paged_decode_available,
++    paged_attention_decode_fp8 as paged_attention_decode_fp8_op,
++)
++from mslk.testing.device import skipUnlessRocm
++from parameterized import parameterized
++
++Args = Tuple[Tuple[Any, ...], Dict[str, Any]]
++
++
++def _paged_attention_decode_fp8_args(row: Dict[str, str]) -> Args:
++    if not is_fp8_paged_decode_available():
++        raise unittest.SkipTest("requires a gfx950 GPU with FlyDSL")
++    heads, kv_heads = int(row["num_heads"]), int(row["num_kv_heads"])
++    head_size, block_size = int(row["head_size"]), int(row["block_size"])
++    batch, context = int(row["batch_max"]), int(row["context_max"])
++    width = context // block_size
++    cache = (batch * width, kv_heads, block_size, head_size)
++    key_cache = torch.randn(cache, device="cuda").to(torch.float8_e4m3fn)
++    value_cache = torch.randn(cache, device="cuda").to(torch.float8_e4m3fn)
++    scale = torch.ones(*cache[:3], 1, device="cuda")
++    query = torch.randn(batch, heads, head_size, dtype=torch.bfloat16, device="cuda")
++    return (
++        torch.empty_like(query),
++        query,
++        # [blocks, kv_heads, head_size / 16, block_size, 16]
++        key_cache.view(*cache[:3], head_size // 16, 16)
++        .permute(0, 1, 3, 2, 4)
++        .contiguous(),
++        # [blocks, kv_heads, block_size / 16, head_size, 16]
++        value_cache.view(*cache[:2], block_size // 16, 16, head_size)
++        .transpose(3, 4)
++        .contiguous(),
++        torch.full((batch,), context, dtype=torch.int32, device="cuda"),
++        torch.arange(batch * width, dtype=torch.int32, device="cuda").view(batch, -1),
++        head_size**-0.5,
++        scale,
++        scale,
++    ), {}
++
++
++# (name, routing, the op, arguments for a table row)
++CASES: List[Tuple[str, OpRouting, Callable[..., Any], Callable[..., Args]]] = [
++    (
++        "paged_attention_decode_fp8",
++        paged_attention_decode_fp8.ROUTING,
++        paged_attention_decode_fp8_op,
++        _paged_attention_decode_fp8_args,
++    ),
++]
++
++
++@skipUnlessRocm()
++class DispatchTest(unittest.TestCase):
++    @parameterized.expand(CASES, skip_on_empty=True)
++    def test_follows_its_tuning_table(
++        self,
++        _name: str,
++        routing: OpRouting,
++        op: Callable[..., Any],
++        make_args: Callable[..., Args],
++    ) -> None:
++        if not is_aiter_enabled(routing.op):
++            self.skipTest("requires the pinned aiter, enabled for the op")
++        gfx, cu_num = device_key(torch.cuda.current_device())
++        table = routing.table
++        columns = table.key_columns + (table.bucket_column,)
++        rows = [r for r in table.rows if (r["gfx"], r["cu_num"]) == (gfx, str(cu_num))]
++        # The cheapest shape for each backend is enough to show the routing.
++        rows.sort(key=lambda r: math.prod(int(r[c]) for c in columns if r[c].isdigit()))
++        cheapest = {}
++        for row in rows:
++            cheapest.setdefault(row["backend"], row)
++        if not cheapest:
++            self.skipTest(f"no tuning-table rows for {gfx} with {cu_num} CUs")
++        for expected, row in cheapest.items():
++            args, kwargs = make_args(row)
++            spies = {b: mock.Mock(wraps=fn) for b, fn in routing.backends.items()}
++            with mock.patch.dict(routing.backends, spies):
++                op(*args, **kwargs)
++            for backend, spy in spies.items():
++                self.assertEqual(spy.call_count, int(backend == expected), row)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/attention/flydsl/pa_decode_fp8_test.py b/test/attention/flydsl/pa_decode_fp8_test.py
+index 731e708..6da8dde 100644
+--- a/test/attention/flydsl/pa_decode_fp8_test.py
++++ b/test/attention/flydsl/pa_decode_fp8_test.py
+@@ -5,10 +5,16 @@
+ # LICENSE file in the root directory of this source tree.
+ 
+ """paged_attention_decode_fp8 against an fp32 reference over the dequantized
+-cache: ragged lengths, padded block tables and CUDA graphs."""
++cache: ragged lengths, padded block tables and CUDA graphs, through its routing
++and with each backend forced."""
++
++import contextlib
+ 
+ import pytest
+ import torch
++from mslk.aiter.common import is_aiter_enabled
++from mslk.aiter.routing import device_key, force_backend
++from mslk.attention.dispatch.paged_attention_decode_fp8 import OP, ROUTING
+ from mslk.attention.flydsl.decode.pa_decode_fp8_dispatch import (
+     is_fp8_paged_decode_available,
+     paged_attention_decode_fp8,
+@@ -92,6 +98,41 @@ def reference(args, kv):
+     return out.squeeze(1)
+ 
+ 
++BACKENDS = ("default", "mslk", "aiter")
++
++# (num_heads, num_kv_heads, head_dim, block_size, context_max, batch) shapes that
++# the tuning table routes to each backend on gfx950, so that the routed path is
++# covered on both.
++_ROUTED_SHAPES = {
++    "aiter": [(32, 8, 128, 16, 256, 256), (64, 8, 128, 64, 32768, 1)],
++    "mslk": [(8, 1, 128, 16, 1024, 8), (4, 1, 128, 64, 256, 4)],
++}
++
++
++@contextlib.contextmanager
++def backend_forced(backend):
++    if backend == "aiter" and not is_aiter_enabled(OP):
++        pytest.skip("requires the pinned aiter, enabled for the op")
++    with (
++        force_backend(OP, backend) if backend != "default" else contextlib.nullcontext()
++    ):
++        yield
++
++
++def run_and_check(args, kv, backend):
++    """Run the op on ``args`` and check its output; returns the backend that
++    served it."""
++    served_by = ROUTING.backend_for(*args)
++    paged_attention_decode_fp8(*args)
++    torch.testing.assert_close(
++        args[0].float(), reference(args, kv), atol=ATOL, rtol=RTOL
++    )
++    if backend != "default":
++        assert served_by == backend
++    return served_by
++
++
++@pytest.mark.parametrize("backend", BACKENDS)
+ @pytest.mark.parametrize(
+     "num_heads,num_kv_heads,head_dim,block_size,lengths,dtype",
+     [
+@@ -106,19 +147,51 @@ def reference(args, kv):
+     ],
+ )
+ def test_matches_reference(
+-    num_heads, num_kv_heads, head_dim, block_size, lengths, dtype
++    num_heads, num_kv_heads, head_dim, block_size, lengths, dtype, backend
+ ):
+     torch.manual_seed(0)
+     args, kv = make_inputs(
+         num_heads, num_kv_heads, head_dim, block_size, lengths, dtype=dtype
+     )
+-    paged_attention_decode_fp8(*args)
+-    out = args[0]
+-    torch.testing.assert_close(out.float(), reference(args, kv), atol=ATOL, rtol=RTOL)
++    with backend_forced(backend):
++        run_and_check(args, kv, backend)
++
++
++@pytest.mark.parametrize(
++    "shape,expected",
++    [(shape, b) for b, shapes in _ROUTED_SHAPES.items() for shape in shapes],
++)
++def test_routes_by_its_tuning_table(shape, expected):
++    num_heads, num_kv_heads, head_dim, block_size, context_max, batch = shape
++    torch.manual_seed(0)
++    # Lengths spread over (context_max / 2, context_max], as in tuning; the
++    # longest fills the block table.
++    lengths = [context_max - context_max // 2 * b // batch for b in range(batch)]
++    args, kv = make_inputs(num_heads, num_kv_heads, head_dim, block_size, lengths)
++    served_by = run_and_check(args, kv, "default")
++    gfx, cu_num = device_key(torch.cuda.current_device())
++    covered = any(
++        (r["gfx"], r["cu_num"]) == (gfx, str(cu_num)) for r in ROUTING.table.rows
++    )
++    if is_aiter_enabled(OP) and covered:
++        assert served_by == expected, (
++            "the tuning table no longer routes this shape to "
++            f"{expected}; replace it in _ROUTED_SHAPES with one it does"
++        )
++    else:
++        assert served_by == "mslk"
++
++
++def test_aiter_leaves_calls_it_cannot_take_to_mslk():
++    torch.manual_seed(0)
++    args, kv = make_inputs(16, 4, 192, 16, [300, 17])  # head size 192
++    with backend_forced("aiter"):
++        assert run_and_check(args, kv, "default") == "mslk"
+ 
+ 
++@pytest.mark.parametrize("backend", BACKENDS)
+ @pytest.mark.parametrize("block_size", [16, 64])
+-def test_cuda_graph_replays_new_lengths_and_pages(block_size):
++def test_cuda_graph_replays_new_lengths_and_pages(block_size, backend):
+     """A captured call reads the lengths and block table at replay."""
+     torch.manual_seed(0)
+     num_heads, num_kv_heads, head_dim, parts = 32, 8, 128, 8
+@@ -141,10 +214,11 @@ def test_cuda_graph_replays_new_lengths_and_pages(block_size):
+             temporary_output=temporary_output,
+         )
+ 
+-    run()  # compile before capturing
+-    graph = torch.cuda.CUDAGraph()
+-    with torch.cuda.graph(graph):
+-        run()
++    with backend_forced(backend):
++        run()  # compile before capturing
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            run()
+ 
+     context_lengths.copy_(torch.tensor([1, 4096, 2000, 777]))
+     block_tables.copy_(block_tables[:, torch.randperm(block_tables.shape[1])])
+-- 
+2.43.0
+

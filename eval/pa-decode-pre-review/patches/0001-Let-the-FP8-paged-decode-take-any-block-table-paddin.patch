@@ -1,0 +1,260 @@
+From ae99014ac0b978b60dbff6f157e199f3a5c4b4ae Mon Sep 17 00:00:00 2001
+From: amd-weisun <Wei.Sun@amd.com>
+Date: Wed, 18 Nov 2026 15:01:55 +0000
+Subject: [PATCH 1/2] Let the FP8 paged decode take any block-table padding,
+ and test it
+
+paged_attention_decode_fp8 (FlyDSL, gfx950) loads a whole 256-token tile of
+block-table entries and masks the tokens past each sequence's context only
+after reading their pages. Slots of the table past a sequence's pages are
+padding, which callers may fill with anything (the other FlyDSL paged decodes
+are tested with -1 there), but this kernel used them as page indices: a
+padding entry outside the cache faults the GPU (memory aperture violation).
+
+The kernel now replaces entries past the context with block 0 when it stages
+them, so masked tokens read a page that exists. The cost is within noise
+(11.9 -> 12.0 us at batch 1, 1k context; others unchanged).
+
+The op had no tests. The new pa_decode_fp8_test.py compares it with an fp32
+reference over the dequantized cache, on ragged lengths (including empty
+sequences and ones shorter than a page), block sizes 16 and 64, head sizes 64,
+128 and 256, group sizes 1 to 16, f16 and bf16 queries, -1 padding, and a CUDA
+graph replayed with new lengths and pages. On the old kernel the second case
+faults. ROCm CI skips test/attention/ unless a file is enabled explicitly, so
+the new file is.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ci/scripts/mslk_test.bash                     |   1 +
+ mslk/attention/flydsl/decode/pa_decode_fp8.py |  33 +++-
+ test/attention/flydsl/pa_decode_fp8_test.py   | 155 ++++++++++++++++++
+ 3 files changed, 183 insertions(+), 6 deletions(-)
+ create mode 100644 test/attention/flydsl/pa_decode_fp8_test.py
+
+diff --git a/ci/scripts/mslk_test.bash b/ci/scripts/mslk_test.bash
+index 7e4b3df..f52024b 100644
+--- a/ci/scripts/mslk_test.bash
++++ b/ci/scripts/mslk_test.bash
+@@ -159,6 +159,7 @@ __configure_mslk_test_rocm () {
+   )
+   export explicitly_enabled_tests=(
+     ./attention/fmha/flydsl_backward_gfx950_test.py
++    ./attention/flydsl/pa_decode_fp8_test.py
+   )
+ }
+ 
+diff --git a/mslk/attention/flydsl/decode/pa_decode_fp8.py b/mslk/attention/flydsl/decode/pa_decode_fp8.py
+index c7a84e8..dc80602 100644
+--- a/mslk/attention/flydsl/decode/pa_decode_fp8.py
++++ b/mslk/attention/flydsl/decode/pa_decode_fp8.py
+@@ -1601,19 +1601,40 @@ def compile_pa_decode_ps(
+                 [],
+             )
+ 
++        # Table entries past the context are padding and may hold any value; the
++        # masked tail of a tile reads block 0 instead, which always exists.
++        num_context_blocks = (context_len + fx.Int32(_block_size - 1)) // fx.Int32(
++            _block_size
++        )
++        zero_block = arith.constant(0, type=T.i32)
++
+         def _pa_small_block_stage_phys_blocks(partition_block_base):
+             # bt offset is wave-uniform -> s_buffer_load into SGPRs, avoiding the
+             # vmcnt(0) drain and the downstream readfirstlane of the VMEM path.
+             if const_expr(block_size == 64):
+-                bt_elem_off = batch_idx * stride_bt_seq + partition_block_base + warp_id
++                block = partition_block_base + warp_id
++                bt_elem_off = batch_idx * stride_bt_seq + block
+                 phys_blocks = _s_buffer_load(bt_elem_off * fx.Int32(4), vec_width=1)
++                phys_blocks = arith.select(
++                    block < num_context_blocks, phys_blocks, zero_block
++                )
+             else:
+-                bt_elem_off = (
+-                    batch_idx * stride_bt_seq
+-                    + partition_block_base
+-                    + warp_id * fx.Int32(TLOOP)
++                first = partition_block_base + warp_id * fx.Int32(TLOOP)
++                bt_elem_off = batch_idx * stride_bt_seq + first
++                loaded = fx.Vector(
++                    _s_buffer_load(bt_elem_off * fx.Int32(4), vec_width=TLOOP)
++                )
++                phys_blocks = fx.Vector.from_elements(
++                    [
++                        arith.select(
++                            first + fx.Int32(i) < num_context_blocks,
++                            loaded[i],
++                            zero_block,
++                        )
++                        for i in range_constexpr(TLOOP)
++                    ],
++                    dtype=fx.Int32,
+                 )
+-                phys_blocks = _s_buffer_load(bt_elem_off * fx.Int32(4), vec_width=TLOOP)
+             return phys_blocks
+ 
+         def _pa_small_block_store_phys_blocks_to_lds(phys_block_vec):
+diff --git a/test/attention/flydsl/pa_decode_fp8_test.py b/test/attention/flydsl/pa_decode_fp8_test.py
+new file mode 100644
+index 0000000..731e708
+--- /dev/null
++++ b/test/attention/flydsl/pa_decode_fp8_test.py
+@@ -0,0 +1,155 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""paged_attention_decode_fp8 against an fp32 reference over the dequantized
++cache: ragged lengths, padded block tables and CUDA graphs."""
++
++import pytest
++import torch
++from mslk.attention.flydsl.decode.pa_decode_fp8_dispatch import (
++    is_fp8_paged_decode_available,
++    paged_attention_decode_fp8,
++)
++from paged_reference import paged_reference
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available() or not is_fp8_paged_decode_available(),
++    reason="requires a gfx950 GPU with FlyDSL",
++)
++
++FP8 = torch.float8_e4m3fn
++# The kernels also round the query and the softmax probabilities to FP8, which
++# puts a few elements up to 20% of the output scale off. The values of each
++# sequence are scaled by the square root of its length so that its outputs are
++# O(1) at any length; then a wrong head, page or length fails by several times
++# this tolerance, except for a few missing tokens of a long sequence.
++ATOL = RTOL = 0.3
++
++
++def _cdiv(a: int, b: int) -> int:
++    return -(-a // b)
++
++
++def make_inputs(num_heads, num_kv_heads, head_dim, block_size, lengths, dtype=None):
++    """Arguments of the op for one sequence per entry of ``lengths``: a
++    per-token FP8 cache with pages in random order (see ATOL for the values),
++    and block-table slots past each sequence's pages set to -1. Also returns
++    the dequantized cache as [pages, block_size, num_kv_heads, head_dim] for
++    ``paged_reference``."""
++    batch = len(lengths)
++    pages = [_cdiv(n, block_size) for n in lengths]
++    width = max(1, *pages)
++    num_blocks = sum(pages) + 1
++
++    def quantize(x):
++        scale = x.abs().amax(-1, keepdim=True) / torch.finfo(FP8).max
++        xq = (x / scale).to(FP8)
++        return xq, scale, xq.float() * scale
++
++    block_tables = torch.full((batch, width), -1, dtype=torch.int32, device="cuda")
++    order = torch.randperm(num_blocks, dtype=torch.int32, device="cuda")
++    value_size = torch.ones(num_blocks, 1, 1, 1, device="cuda")
++    start = 0
++    for b, n in enumerate(pages):
++        block_tables[b, :n] = order[start : start + n]
++        value_size[order[start : start + n].long()] = max(lengths[b], 1) ** 0.5
++        start += n
++
++    shape = (num_blocks, num_kv_heads, block_size, head_dim)
++    kq, key_scale, k = quantize(torch.randn(shape, device="cuda"))
++    vq, value_scale, v = quantize(
++        (torch.rand(shape, device="cuda") * 2 - 1) * value_size
++    )
++    # [blocks, kv_heads, head_dim / 16, block_size, 16]
++    key_cache = kq.view(*shape[:3], head_dim // 16, 16).permute(0, 1, 3, 2, 4)
++    # [blocks, kv_heads, block_size / 16, head_dim, 16]
++    value_cache = vq.view(*shape[:2], block_size // 16, 16, head_dim).transpose(3, 4)
++    query = torch.randn(
++        batch, num_heads, head_dim, dtype=dtype or torch.bfloat16, device="cuda"
++    )
++    args = (
++        torch.full_like(query, float("nan")),
++        query,
++        key_cache.contiguous(),
++        value_cache.contiguous(),
++        torch.tensor(lengths, dtype=torch.int32, device="cuda"),
++        block_tables,
++        head_dim**-0.5,
++        key_scale,
++        value_scale,
++    )
++    return args, (k.transpose(1, 2), v.transpose(1, 2))
++
++
++def reference(args, kv):
++    _, query, _, _, context_lengths, block_tables, *_ = args
++    out = paged_reference(
++        query.unsqueeze(1), *kv, block_tables, context_lengths, causal=False
++    )
++    return out.squeeze(1)
++
++
++@pytest.mark.parametrize(
++    "num_heads,num_kv_heads,head_dim,block_size,lengths,dtype",
++    [
++        (8, 1, 128, 16, [1], None),
++        (32, 8, 128, 16, [1, 15, 17, 300], None),  # within and across pages
++        (64, 8, 128, 64, [4096, 63, 1000], None),
++        (16, 1, 128, 16, [32768, 5000], None),
++        (16, 4, 64, 16, [257, 512, 0, 2047, 9], None),  # one empty sequence
++        (8, 8, 256, 64, [3000, 1, 700, 2048], None),
++        (32, 8, 128, 16, [(37 * b) % 2048 + 1 for b in range(64)], None),
++        (32, 8, 128, 16, [1000, 7], torch.float16),
++    ],
++)
++def test_matches_reference(
++    num_heads, num_kv_heads, head_dim, block_size, lengths, dtype
++):
++    torch.manual_seed(0)
++    args, kv = make_inputs(
++        num_heads, num_kv_heads, head_dim, block_size, lengths, dtype=dtype
++    )
++    paged_attention_decode_fp8(*args)
++    out = args[0]
++    torch.testing.assert_close(out.float(), reference(args, kv), atol=ATOL, rtol=RTOL)
++
++
++@pytest.mark.parametrize("block_size", [16, 64])
++def test_cuda_graph_replays_new_lengths_and_pages(block_size):
++    """A captured call reads the lengths and block table at replay."""
++    torch.manual_seed(0)
++    num_heads, num_kv_heads, head_dim, parts = 32, 8, 128, 8
++    args, kv = make_inputs(num_heads, num_kv_heads, head_dim, block_size, [4096] * 4)
++    output, _, _, _, context_lengths, block_tables, *_ = args
++    context_lengths.copy_(torch.tensor([1500, 3, 4096, 250]))
++    scratch = (4, num_kv_heads, parts, num_heads // num_kv_heads)
++    exp_sums = torch.empty(scratch, device="cuda")
++    max_logits = torch.empty(scratch, device="cuda")
++    temporary_output = torch.empty(
++        *scratch, head_dim, dtype=torch.bfloat16, device="cuda"
++    )
++
++    def run():
++        paged_attention_decode_fp8(
++            *args,
++            max_context_partition_num=parts,
++            exp_sums=exp_sums,
++            max_logits=max_logits,
++            temporary_output=temporary_output,
++        )
++
++    run()  # compile before capturing
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run()
++
++    context_lengths.copy_(torch.tensor([1, 4096, 2000, 777]))
++    block_tables.copy_(block_tables[:, torch.randperm(block_tables.shape[1])])
++    output.fill_(float("nan"))
++    graph.replay()
++    torch.testing.assert_close(
++        output.float(), reference(args, kv), atol=ATOL, rtol=RTOL
++    )
+-- 
+2.43.0
+

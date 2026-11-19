@@ -1,0 +1,43 @@
+{
+  "name": "mslk-rocm-review",
+  "description": "Independent, read-only reviewer for MSLK changes on the ROCm side: guards and fallback, kernel memory safety, CUDA graphs, tests and tolerances, ROCm CI wiring, performance, aiter integration.",
+  "version": "0.4.0",
+  "author": { "name": "amd-weisun" },
+  "userConfig": {
+    "container": {
+      "type": "string",
+      "title": "Dev container",
+      "description": "Name of your running MSLK dev container (docker), e.g. alice_mslk"
+    },
+    "repo_in_container": {
+      "type": "string",
+      "title": "Repo path in the container",
+      "description": "Where your MSLK checkout is mounted inside the container, e.g. /workspace/MSLK"
+    },
+    "home_in_container": {
+      "type": "string",
+      "title": "Home path in the container",
+      "description": "Where your host home directory is mounted inside the container, e.g. /mnt/host_home"
+    },
+    "scratch_dir": {
+      "type": "string",
+      "title": "Probe directory (host)",
+      "description": "Host directory under your home for the reviewer's probe scripts, never inside the repo, e.g. ~/scratch/review"
+    },
+    "python_setup": {
+      "type": "string",
+      "title": "Python setup command",
+      "description": "Shell command run in the container before Python, e.g. export PATH=/opt/venv/bin:$PATH"
+    },
+    "aiter_source": {
+      "type": "string",
+      "title": "aiter source path in the container",
+      "description": "Installed aiter package directory, e.g. /opt/venv/lib/python3.12/site-packages/aiter"
+    },
+    "lint_bin": {
+      "type": "string",
+      "title": "Lint tools directory in the container",
+      "description": "Directory holding ufmt and flake8, e.g. /opt/lintenv/bin"
+    }
+  }
+}
