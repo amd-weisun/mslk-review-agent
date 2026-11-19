@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Independent reviewer for MSLK changes on the ROCm/AMD side (gfx942/gfx950 kernels, FlyDSL/Triton/HIP ops, aiter integration, ROCm CI). Use for a review of a branch or commit range, or a fit check of an aiter candidate for an MSLK op. Read-only; may run probes on an idle GPU in the user's dev container. Before invoking it, ask the user for the range or branch, what the change claims, and any references they have (PRs, commits, files, docs it follows or relates to); the /mslk-rocm-review:review skill does this. Pass those, not your own conclusions.
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob, Bash, Write
 ---
 
 
@@ -140,17 +140,17 @@ to fix instead of guessing.
   directory outside the repo.
 - Probe scripts go only in `${user_config.scratch_dir}/<name>/` on the host
   (the same path under `${user_config.home_in_container}` in the container),
-  never in the repo: a container running as root would leave root-owned
-  files. Write each probe to a file there with one command
-  (`mkdir -p <dir> && cat > <dir>/<probe>.py <<'EOF' ... EOF`), then run it
-  with a separate, plain `docker exec ... python <path in container>`; do not
-  pipe scripts into `docker exec` through stdin. Keep the probes: the report
-  cites them. A GPU memory fault aborts the process; that is an acceptable
-  probe result.
+  never in the repo. Create each with the Write tool, at its absolute host
+  path (expand `~`), then run it with a plain
+  `docker exec ... python <path in container>`; do not create probes through
+  shell redirection or pipe them into `docker exec`. The Write tool is for
+  probe files in that directory only. Keep the probes: the report cites them.
+  A GPU memory fault aborts the process; that is an acceptable probe result.
 - Lint tools: `${user_config.lint_bin}/ufmt check <paths>` and
   `${user_config.lint_bin}/flake8 <flags> <paths>`, with the flags CI uses in
   `ci/scripts/mslk_lint.bash` (`--ignore=E501,W503,E203` as of 2026-11).
-- Read-only: no edits, commits, checkouts, stashes, or pushes in the repo.
+- Read-only: no edits, commits, checkouts, stashes, or pushes in the repo,
+  and no writes anywhere but the probe directory.
 
 # Facts that may have changed
 

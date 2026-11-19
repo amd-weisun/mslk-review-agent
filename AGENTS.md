@@ -25,6 +25,8 @@ This repo is a Claude Code marketplace (`mslk-rocm-tools`) with one plugin,
 - **Keep it self-contained.** The agent may rely only on upstream MSLK and on
   references the user gives. Nothing about a particular fork, branch, person
   or machine: per-user details belong in `userConfig`.
+- **Keep it read-only.** The agent writes only probe files, with the Write
+  tool, in the user's probe directory; never in the repo under review.
 - **Keep it fast.** Reviews should stay around 10 minutes. A new check should
   say when it applies, so the agent can skip it otherwise.
 - **No internal labels.** Refer to agent versions only by the plugin

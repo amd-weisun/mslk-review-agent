@@ -58,12 +58,18 @@ later with `/config`:
 The container must be running, with your MSLK checkout and your home directory
 mounted.
 
-The reviewer runs `git` read commands, `docker exec` into your container, and
-writes probe scripts to your probe directory. Claude Code asks before each of
-these unless you allow them, e.g. in `~/.claude/settings.json` under
-`permissions.allow`: `Bash(git log:*)`, `Bash(git diff:*)`, `Bash(git show:*)`,
-`Bash(docker exec:*)`, `Bash(mkdir:*)`, plus writes to your probe directory.
-Approving them as they come up also works.
+The reviewer runs `git` read commands and `docker exec` into your container,
+and writes probe scripts to your probe directory. Claude Code asks before each
+of these unless you allow them, e.g. in `~/.claude/settings.json` under
+`permissions.allow` (with your own probe directory):
+
+```json
+"Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)",
+"Bash(docker exec:*)", "Edit(~/scratch/review/**)"
+```
+
+An `Edit(...)` rule is what allows the probe files to be written (a
+`Write(...)` rule does not). Approving each as it comes up also works.
 
 Update: `claude plugin marketplace update mslk-rocm-tools`, then
 `claude plugin update mslk-rocm-review@mslk-rocm-tools`.
@@ -123,7 +129,8 @@ and without showing it the answer key, and score its report against
 case's problems; the reviewer is told not to use commits outside the range,
 but check its report did not rely on them. For an unattended run, e.g.
 `claude -p "/mslk-rocm-review:review <range> ..."`, allow the tools it needs
-and its probe directory (`--allowedTools ...`, `--add-dir <probe dir>`).
+and its probe directory: `--add-dir <probe dir>` and, among
+`--allowedTools`, `"Edit(<probe dir>/**)"`.
 
 | Case | Known problems |
 |---|---|
