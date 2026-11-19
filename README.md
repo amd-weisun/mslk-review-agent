@@ -100,6 +100,9 @@ git worktree add --detach ~/scratch/wt/review <commit>
 ln -sr <clone>/mslk/mslk.so ~/scratch/wt/review/mslk/mslk.so   # reuse your build if C++ is unchanged
 ```
 
+`examples/` has a full report from a real run, scored against the case's
+answer key, to show what to expect.
+
 Check its findings before acting on them: it separates reproduced from
 suspected, but it can still be wrong.
 
