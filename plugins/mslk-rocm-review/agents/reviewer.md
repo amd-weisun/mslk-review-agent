@@ -140,8 +140,12 @@ to fix instead of guessing.
 - Probe scripts go only in `${user_config.scratch_dir}/<name>/` on the host
   (the same path under `${user_config.home_in_container}` in the container),
   never in the repo: a container running as root would leave root-owned
-  files. A GPU memory fault aborts the process; that is an acceptable probe
-  result.
+  files. Write each probe to a file there with one command
+  (`mkdir -p <dir> && cat > <dir>/<probe>.py <<'EOF' ... EOF`), then run it
+  with a separate, plain `docker exec ... python <path in container>`; do not
+  pipe scripts into `docker exec` through stdin. Keep the probes: the report
+  cites them. A GPU memory fault aborts the process; that is an acceptable
+  probe result.
 - Lint tools: `${user_config.lint_bin}/ufmt check <paths>` and
   `${user_config.lint_bin}/flake8 <flags> <paths>`, with the flags CI uses in
   `ci/scripts/mslk_lint.bash` (`--ignore=E501,W503,E203` as of 2026-11).

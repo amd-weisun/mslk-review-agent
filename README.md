@@ -58,6 +58,13 @@ later with `/config`:
 The container must be running, with your MSLK checkout and your home directory
 mounted.
 
+The reviewer runs `git` read commands, `docker exec` into your container, and
+writes probe scripts to your probe directory. Claude Code asks before each of
+these unless you allow them, e.g. in `~/.claude/settings.json` under
+`permissions.allow`: `Bash(git log:*)`, `Bash(git diff:*)`, `Bash(git show:*)`,
+`Bash(docker exec:*)`, `Bash(mkdir:*)`, plus writes to your probe directory.
+Approving them as they come up also works.
+
 Update: `claude plugin marketplace update mslk-rocm-tools`, then
 `claude plugin update mslk-rocm-review@mslk-rocm-tools`.
 
