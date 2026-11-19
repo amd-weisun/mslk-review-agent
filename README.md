@@ -118,13 +118,19 @@ Then run the reviewer on the printed range with that worktree, without hints
 and without showing it the answer key, and score its report against
 `eval/<case>/answer_key.md`.
 
-| Case | Known problems | Scores |
-|---|---|---|
-| `pa-decode-pre-review` | 15 | v1: 9/15 (no longer held out) |
-| `bf16-grouped-without-fixes` | 5 | v2: 4/5 (held out) |
+| Case | Known problems |
+|---|---|
+| `pa-decode-pre-review` | 17 |
+| `bf16-grouped-without-fixes` | 9 |
 
-A case is only a fair test of agent versions written before anyone looked at
-the agent's results on it. When the agent misses something real, add the
+Record each run in `eval/RESULTS.md`: plugin version, case, problems found,
+false claims, and wall time.
+
+Avoid fitting the agent to the cases: when it misses something, change the
+checklist only by a general principle that would also apply to other
+changes, never by naming the case's specifics. A case whose misses shaped the
+checklist overstates later scores (its answer key says so), so keep adding
+fresh cases. When the agent misses something real in a review, add the
 change as a new case: `git format-patch <base>..<head> -o eval/<case>/patches`,
 the base commit in `eval/<case>/BASE`, and an answer key.
 
@@ -132,5 +138,5 @@ the base commit in `eval/<case>/BASE`, and an answer key.
 
 Edit `plugins/mslk-rocm-review/agents/reviewer.md`, bump `version` in
 `plugins/mslk-rocm-review/.claude-plugin/plugin.json`, run
-`claude plugin validate ./plugins/mslk-rocm-review`, and record the new
-version's eval scores in this README.
+`claude plugin validate ./plugins/mslk-rocm-review`, and record its eval
+results in `eval/RESULTS.md`.

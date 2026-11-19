@@ -1,25 +1,31 @@
 # Case pa-decode-pre-review: FP8 paged decode routed to aiter, before review
 
-Base: upstream MSLK `BASE` (188df20). Patches: `patches/` — the paged-decode MSLK fix and its aiter routing, as first written, before any review.
+Base: upstream MSLK `BASE`. Patches: `patches/` — an MSLK fix to the FP8
+paged-attention decode kernel, and that op routed to aiter's FlyDSL `pa_decode`
+through a tuning table, as first written, before any review.
 
-| # | Known problem | Kind | v1 |
-|---|---|---|---|
-| 1 | FP8 cache dtype other than e4m3fn (uint8 / fnuz) routed to aiter, raises | bug | caught |
-| 2 | Scales of a larger block pool routed to aiter, raises | bug | caught |
-| 3 | Non-3-D output routed to aiter, raises | bug | caught |
-| 4 | Block table with spare rows routed to aiter, raises | bug | caught (by reading) |
-| 5 | Scales on CPU routed to aiter, raises | bug | missed |
-| 6 | f16 queries routed though only bf16 was tuned | risk | missed |
-| 7 | 4-D (non-transposed) V cache routed to aiter | risk | missed |
-| 8 | block_tables=None / bad query rank change error type with aiter off | bug | caught |
-| 9 | Zero-width block table faults (pre-existing) | bug | missed |
-| 10 | Block-table descriptor unbounded, reads past last row (pre-existing) | bug | caught (suspected) |
-| 11 | int64 lengths/tables silently misread by MSLK (pre-existing) | bug | caught |
-| 12 | Block 0 must hold finite values after the fix; undocumented | doc | missed |
-| 13 | aiter JIT-compiles per batch size | risk | caught |
-| 14 | Input builder copied in test, tuner, dispatch test | nit | missed |
-| 15 | MSLK needs preallocated scratch to capture, aiter doesn't | risk | missed |
+Score a report by how many known problems it finds (a suspected finding with
+the right cause counts), and note false claims separately.
 
-v1: 9/15. Extra true findings: V-scale errors < ~30% pass the tolerance; 2-D query
-error type; return value differs per backend. False claim: lint not installed.
-Not held out from v2 on: the agent's checklist was revised after missing items here.
+| # | Known problem | Kind |
+|---|---|---|
+| 1 | FP8 cache dtype other than e4m3fn (`uint8`, `fnuz`) routed to aiter, which raises | bug |
+| 2 | Scales covering a larger block pool than the cache routed to aiter, which raises | bug |
+| 3 | Output not shaped like the query (2-D, 4-D) routed to aiter, which raises | bug |
+| 4 | Block table with spare rows (more rows than sequences) routed to aiter, which raises | bug |
+| 5 | Scales on the CPU routed to aiter, which raises | bug |
+| 6 | f16 queries routed to aiter though the table was tuned with bf16 only | risk |
+| 7 | 4-D (non-transposed) V cache routed to aiter | risk |
+| 8 | With aiter off, `block_tables=None` or a bad query rank raises a different error than the base (routing key computed first) | bug |
+| 9 | Zero-width block table faults the GPU (pre-existing) | bug |
+| 10 | Block-table buffer descriptor unbounded: tile reads past the last row (pre-existing) | bug |
+| 11 | int64 context lengths or block tables silently misread by MSLK's kernel (pre-existing) | bug |
+| 12 | After the fix, masked reads go to block 0, which must hold finite values; not documented | doc |
+| 13 | aiter JIT-compiles per batch size: first call at a new batch is slow in eager serving | risk |
+| 14 | Cache-building input code copied in the test, the tuning script and the dispatch test | nit |
+| 15 | MSLK's kernel needs preallocated scratch to be captured in a CUDA graph, aiter's does not: capture works on some shapes, fails on others | risk |
+| 16 | Test tolerance (atol = rtol = 0.3) lets V-scale errors under ~30% pass | test gap |
+| 17 | The op's return string differs by backend (`"aiter"` vs `"ps_small_block"`) | nit |
+
+Note: this case was used while the agent's checklist was written, so scores on
+it overstate how the agent does on unseen changes.

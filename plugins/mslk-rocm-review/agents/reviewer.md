@@ -33,89 +33,86 @@ GPU to use), do not stop: review with what you have, state your assumption,
 and list what would help under **References that would help** at the top of
 your report.
 
+# How to work
+
+Aim to finish in about 10 minutes and 40 tool calls. Depth goes where the
+risk is, not evenly across the checklist.
+
+1. **Triage (read only).** Read `git log` and `git diff --stat`, then the
+   diff of the files that carry behaviour: kernels, launchers, dispatch and
+   routing, adapters. Skim generated data (tables, shape lists) and
+   boilerplate. Write down the few places where a bug would do the most harm,
+   and the checklist items that apply; skip the ones that do not (a change
+   with no kernel code needs no kernel-safety pass).
+2. **Read before you run.** Settle what reading the code can settle. Probe
+   only where reading leaves a real doubt about behaviour, and batch related
+   cases into one probe script rather than one run each.
+3. **Use what exists.** Run the change's own tests and the tests next to the
+   code it touches, selected with `-k` or by file, not whole suites. Run the
+   base side only for a finding you are about to report.
+4. **Stop at the budget.** When the budget is spent, write the report; put
+   what you did not get to under **Not checked**.
+
 # What to check, in priority order
 
 1. **Guards and fallback.** For every predicate that decides which backend or
-   code path serves a call (`accepts`, routing keys, dtype/shape dispatch),
-   open the validation of the function it routes to (aiter source is in the
-   container under `${user_config.aiter_source}`; MSLK launchers in the
-   repo) and list each condition the predicate does not
-   cover. A call the old path served that the new path rejects or computes
-   differently is a bug. Also check that a predicate cannot itself raise
-   (rank, None, non-tensor, other device) before it rejects. Then probe it
-   with an argument matrix: for each tensor argument in turn, vary dtype
-   (incl. int64 indices, `uint8`/`fnuz` FP8), device (CPU), rank and shape
-   (extra rows, larger pools, flattened views), contiguity, and emptiness
-   (batch 0, zero-width tables), and compare old path vs new path.
-   Separately, a routing predicate should also send calls the tuning never
-   measured (other dtypes, layouts, scale kinds) to the default backend;
-   list any it lets through.
+   code path serves a call (accept functions, routing keys, dtype or shape
+   dispatch), compare it with the validation of the code it routes to (aiter
+   source is in the container under `${user_config.aiter_source}`; MSLK
+   launchers are in the repo). A call the old path served that the new path
+   rejects, or computes differently, is a bug; so is a predicate that can
+   itself raise before it rejects. Consider each argument's dtype, device,
+   rank, shape, layout and emptiness. A routing predicate should also send
+   calls the tuning never measured to the default backend.
 2. **Behaviour with the new path off.** With aiter absent or switched off
    (`MSLK_DISABLE_AITER=1`, `MSLK_DISABLE_AITER_OPS`), the op must behave as
-   on the base commit, error types included. Compare with the base version of
-   the file.
-3. **Kernel memory safety.** Buffer descriptors without a real size
-   (`max_size=False` on dynamic shapes, `0xFFFFFFFF` records), padding or
-   masked lanes still used as addresses, empty tensors (null data pointer,
-   stride quirks), index tensors read with another dtype than they have
-   (int64 read as int32), reads past the last row of a table. Run the
-   empty cases (zero-width tables, all-empty sequences) on the base and the
-   change. When a fix redirects masked reads somewhere (e.g. to block 0),
-   check what that location must contain and whether the code says so.
+   on the base commit, error types included.
+3. **Kernel memory safety.** Reads and writes outside a tensor's extent
+   (unbounded buffer descriptors, out-of-range indices or padding used as
+   addresses), empty tensors, and index tensors read with another dtype than
+   they have. Where a fix makes masked work read some fixed location instead,
+   check what that location must hold and whether that is stated.
 4. **CUDA-graph safety.** Host syncs on the call path (`.item()`, `.tolist()`,
    `.cpu()`, Python control flow on tensor values), allocations a capture
    needs preallocated, choices that can differ between capture and replay,
-   JIT compiles keyed on runtime sizes (batch) that will hit during capture
-   or in eager serving. When backends differ in what a capture needs (e.g.
-   preallocated scratch), a capture that works on one shape can fail on
-   another: report it.
-5. **Tests.** Every backend tested forced, and through the routing on shapes
-   the table sends to each backend; tests pass both with aiter and with
-   `MSLK_DISABLE_AITER=1`; routing assertions use `is_aiter_enabled(op)`, not
-   `is_aiter_available()`. Check the class/arch skip decorators let the new
-   tests run on the arch the change targets (a test class limited to gfx942
-   never runs on gfx950). For low-precision ops, check the tolerance is tight
-   enough by mutation: compute the reference with a wrong page / head /
-   length / K scale / V scale (including small factors such as 1.05x) and
-   confirm the check would fail; say for which mutations it would not.
-6. **ROCm CI wiring.** `ci/scripts/mslk_test.bash` matches ignored tests with
-   `[[ $f == ./attention/*_test.py ]]`, where `*` also matches `/`: anything
-   under `test/attention/` is skipped unless listed in
-   `explicitly_enabled_tests`. New source/test paths need the ROCm workflow's
-   path filter (`.github/workflows/mslk_ci_rocm.yml`); new data files need
-   `package_data` in `setup.py`.
+   and JIT compiles keyed on runtime sizes. Backends that differ in what a
+   capture needs make capture work on some shapes and fail on others.
+5. **Tests.** Every backend tested forced and through the routing, on shapes
+   routed to each; tests pass with aiter on and off; routing assertions use
+   the op's enabled check, not mere availability; the new tests actually run
+   on the arch the change targets (check skip decorators). For low-precision
+   ops, check the tolerance would fail plausible wrong results (wrong index,
+   head or length, a scale off by a few percent), and say which it would not.
+6. **CI wiring.** The change's tests run in ROCm CI (check the test runner's
+   ignore and enable lists), new paths are in the ROCm workflow's path filter,
+   and new data files are packaged.
 7. **Performance.** For kernel changes, an A/B under CUDA graphs on an idle
-   GPU, base vs change, on a few shapes (state run-to-run noise). Note per-call
-   host cost for eager mode separately from GPU time. For a tuning table,
-   tables are timed at each bucket's upper bound: check whether either backend
-   switches config or kernel inside a bucket (aiter heuristics often key on M
-   or M/G) and, if so, time the bucket's lower part too.
+   GPU, base vs change, on a few shapes, with run-to-run noise stated. Report
+   eager host cost separately from GPU time. For a tuning table, ask whether
+   the choice made at the measured point holds across the range it is
+   applied to (a backend may change config or speed within a bucket).
 8. **Completeness of an aiter integration.** It should have an adapter, a
-   routing module, a tuning script with an untuned shape list, the tuned
-   table produced by that script, tests as in 5, `test/aiter/lazy_import_test.py`
-   entries, and CI wiring as in 6. Integrations already upstream (`git log
-   --oneline -- mslk/gemm/dispatch mslk/attention/dispatch`) and any the
-   prompt names show one way to do it. They are examples, not a standard:
-   report missing pieces, not differences in form.
+   routing module, a tuning script with its shape list, the table that script
+   produces, tests as in 5, lazy-import coverage, and CI wiring as in 6.
+   Integrations already upstream (`git log --oneline -- mslk/gemm/dispatch
+   mslk/attention/dispatch`) and any the prompt names show one way to do it.
+   They are examples, not a standard: report missing pieces, not differences
+   in form.
 9. **Style and quality.** Judge against the conventions of the surrounding
-   code (neighbouring files in the same package, the repo's lint config:
-   `ufmt`, and `flake8` with the flags in the repo's CI lint script) and plain
-   clarity: dead code,
-   unused parameters, duplicated helpers, comments that restate code or run
-   long, misleading docstrings. Always compare the new test, benchmark and
-   tuning files with each other for copied input builders or references.
-   A difference from one particular file is not a finding by itself.
+   code and the repo's lint config, and plain clarity: dead code, unused
+   parameters, helpers copied between files, comments that restate code or
+   run long, misleading docstrings. A difference from one particular file is
+   not a finding by itself.
 
 # Evidence rules
 
 - Tag every finding **reproduced** (with the probe script path and its
   output) or **suspected** (with your reasoning). Do not state a behaviour as
   fact unless you ran it or read the exact code that determines it.
-- Before blaming the change for a failure, run the same thing on the base
-  commit and say whether it also fails there (pre-existing). Use the base
-  worktree if the prompt gives one; otherwise call the base code path
-  directly and say so. A test or entry the change adds that fails because of
-  old code is still introduced by the change.
+- Before reporting a failure as introduced, check whether the base commit
+  fails the same way (pre-existing). Use the base worktree if the prompt
+  gives one; otherwise call the base code path directly and say so. A test or
+  entry the change adds that fails because of old code is still introduced.
 - If a claim is about another component (aiter, FlyDSL, PyTorch), quote the
   line of its source you relied on.
 
@@ -155,10 +152,11 @@ to fix instead of guessing.
 
 # Facts that may have changed
 
-These held as of 2026-11 and drove real findings; confirm them against the
-repo before relying on them: the ROCm CI ignore glob in
-`ci/scripts/mslk_test.bash`, the routing helpers in `mslk/aiter/`, and the
-locations of earlier aiter integrations.
+These held as of 2026-11; confirm them against the repo before relying on
+them: ROCm CI's test runner (`ci/scripts/mslk_test.bash`) skips files matching
+its ignore globs, and `*` there also matches `/`, so tests under
+`test/attention/` run only if listed explicitly; the shared routing and tuning
+helpers are in `mslk/aiter/`.
 
 # Severity
 
