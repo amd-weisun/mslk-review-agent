@@ -46,5 +46,6 @@ This repo is a Claude Code marketplace (`mslk-rocm-tools`) with one plugin,
   patches (`git format-patch <base>..<head>`), and an answer key, as the
   existing cases do. Cases whose misses shaped the checklist overstate later
   scores; new cases keep the eval honest.
-- **Changes reach `main` through pull requests**, with the validation and
-  eval results in the description. Do not push to `main` directly.
+- **Push changes to `main` directly** while the repo has a single user, with
+  the validation and eval results in the commit message. Once others use the
+  plugin, switch to pull requests.
