@@ -46,13 +46,20 @@ risk is, not evenly across the checklist.
    boilerplate. Write down the few places where a bug would do the most harm,
    and the checklist items that apply; skip the ones that do not (a change
    with no kernel code needs no kernel-safety pass).
-2. **Read before you run.** Settle what reading the code can settle. Probe
+2. **Blast radius (read only, cheap).** With `git grep`, find the callers,
+   wrappers and other entry points of each function whose behaviour or
+   requirements changed, and sibling code in the repo that solves the same
+   problem. If the change fixes a bug, also find comments and workarounds
+   about that bug elsewhere, which may now be obsolete. Note workarounds the
+   repo already applies for the libraries the change combines (e.g. import
+   order in tests).
+3. **Read before you run.** Settle what reading the code can settle. Probe
    only where reading leaves a real doubt about behaviour, and batch related
    cases into one probe script rather than one run each.
-3. **Use what exists.** Run the change's own tests and the tests next to the
+4. **Use what exists.** Run the change's own tests and the tests next to the
    code it touches, selected with `-k` or by file, not whole suites. Run the
    base side only for a finding you are about to report.
-4. **Stop at the budget.** When the budget is spent, write the report; put
+5. **Stop at the budget.** When the budget is spent, write the report; put
    what you did not get to under **Not checked**.
 
 # What to check, in priority order
@@ -65,15 +72,20 @@ risk is, not evenly across the checklist.
    rejects, or computes differently, is a bug; so is a predicate that can
    itself raise before it rejects. Consider each argument's dtype, device,
    rank, shape, layout and emptiness. A routing predicate should also send
-   calls the tuning never measured to the default backend.
+   calls the tuning never measured to the default backend. When a change adds
+   a requirement or validation to a function, every caller and entry point
+   found in triage must still meet it.
 2. **Behaviour with the new path off.** With aiter absent or switched off
    (`MSLK_DISABLE_AITER=1`, `MSLK_DISABLE_AITER_OPS`), the op must behave as
    on the base commit, error types included.
 3. **Kernel memory safety.** Reads and writes outside a tensor's extent
    (unbounded buffer descriptors, out-of-range indices or padding used as
    addresses), empty tensors, and index tensors read with another dtype than
-   they have. Where a fix makes masked work read some fixed location instead,
-   check what that location must hold and whether that is stated.
+   they have. A size, bound or offset derived from shapes, strides or launch
+   dimensions must hold for every layout the function accepts: row stride 0
+   (broadcast), sliced and transposed views, and empty tensors. Where a fix
+   makes masked work read some fixed location instead, check what that
+   location must hold, and whether the base required it.
 4. **CUDA-graph safety.** Host syncs on the call path (`.item()`, `.tolist()`,
    `.cpu()`, Python control flow on tensor values), allocations a capture
    needs preallocated, choices that can differ between capture and replay,
@@ -93,17 +105,27 @@ risk is, not evenly across the checklist.
    eager host cost separately from GPU time. For a tuning table, ask whether
    the choice made at the measured point holds across the range it is
    applied to (a backend may change config or speed within a bucket).
-8. **Completeness of an aiter integration.** It should have an adapter, a
+8. **Consistency and dependencies.** Checks used to make decisions (tuning,
+   routing) must be at least as strict as the tests. A rule that combines
+   several measurements should be explicit and bounded: flag sums or averages
+   that let one regime outweigh another. Docstrings, comments and the
+   change's claims must match the code. Calls into another library should
+   follow its documented usage (read its docstrings); a deviation needs a
+   reason or a measured cost. New tests should follow the workarounds the
+   repo already uses for the same libraries.
+9. **Completeness of an aiter integration.** It should have an adapter, a
    routing module, a tuning script with its shape list, the table that script
    produces, tests as in 5, lazy-import coverage, and CI wiring as in 6.
    Integrations already upstream (`git log --oneline -- mslk/gemm/dispatch
    mslk/attention/dispatch`) and any the prompt names show one way to do it.
    They are examples, not a standard: report missing pieces, not differences
    in form.
-9. **Style and quality.** Judge against the conventions of the surrounding
+10. **Style and quality.** Judge against the conventions of the surrounding
    code and the repo's lint config, and plain clarity: dead code, unused
    parameters, helpers copied between files, comments that restate code or
-   run long, misleading docstrings. A difference from one particular file is
+   run long, misleading docstrings, workarounds the change makes obsolete,
+   and committed generated data beyond what is needed. New helpers and test
+   utilities get edge cases too (empty and single-element inputs). A difference from one particular file is
    not a finding by itself.
 
 # Evidence rules
@@ -171,9 +193,12 @@ how sure you are (that is the evidence tag):
   tests not running in ROCm CI; a tuning table the committed script cannot
   produce.
 - **Medium**: the same kinds of failure, but only on unusual inputs (empty
-  tensors, odd dtypes, other devices); a slowdown beyond run-to-run noise on
-  shapes callers use; a test gap that would let a likely bug through; a
-  routing choice made on behaviour that was never measured.
+  tensors, odd dtypes, other devices, unusual layouts); a new requirement on
+  callers' inputs or data that the base did not have, even if documented; a
+  slowdown beyond run-to-run noise on shapes callers use; a deviation from a
+  dependency's documented usage with a measurable cost; a test gap that would
+  let a likely bug through; a decision check weaker than the tests; a routing
+  choice made on behaviour that was never measured, or by an implicit rule.
 - **Low**: error type or message changes on invalid input, documentation,
   naming, duplication, comments, and other style or clarity issues.
 

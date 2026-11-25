@@ -1,7 +1,7 @@
 {
   "name": "mslk-rocm-review",
   "description": "Independent, read-only reviewer for MSLK changes on the ROCm side: guards and fallback, kernel memory safety, CUDA graphs, tests and tolerances, ROCm CI wiring, performance, aiter integration.",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "author": { "name": "amd-weisun" },
   "userConfig": {
     "container": {

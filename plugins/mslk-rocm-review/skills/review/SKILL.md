@@ -19,6 +19,9 @@ is missing, in one message:
 - **References** they have: PRs, commits, files, tickets, design notes or
   earlier reviews it follows or relates to. Say these are optional but make
   the review sharper.
+- **Where it runs**: the CI or runtime environment the change must work in,
+  if not the user's container (e.g. a ROCm Python SDK such as TheRock, other
+  GPU architectures).
 - **GPU** to use, if they have a preference.
 
 If the user has no references, go ahead without them.
@@ -38,7 +41,7 @@ If the user has no references, go ahead without them.
 
 Launch `mslk-rocm-review:reviewer` with a prompt that contains only facts:
 the mode (diff review or fit check), the range and worktree path, what the
-change claims, the references, and the GPU. Do not add your own opinion of
+change claims, the references, the environment it must work in, and the GPU. Do not add your own opinion of
 the change, or context from other branches or later commits the user did not
 name: the review is meant to be independent of them.
 

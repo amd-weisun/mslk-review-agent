@@ -136,6 +136,7 @@ and its probe directory: `--add-dir <probe dir>` and, among
 |---|---|
 | `pa-decode-pre-review` | 17 |
 | `bf16-grouped-without-fixes` | 9 |
+| `pa-decode-as-submitted` | 10 (found by human reviewers) |
 
 Record each run in `eval/RESULTS.md`: plugin version, case, problems found,
 false claims, and wall time.
