@@ -49,7 +49,9 @@ name: the review is meant to be independent of them.
 
 The reviewer separates reproduced from suspected findings, but it can be
 wrong. Before you present a confirmed bug as fact, check its evidence (read
-the cited code, or rerun its probe if cheap). Then report to the user,
+the cited code, or rerun its probe if cheap). Rerun probes the way the
+reviewer runs them, with `PYTHONDONTWRITEBYTECODE=1` in the `docker exec`, so
+a root container leaves no root-owned files in the user's worktree. Then report to the user,
 keeping the reviewer's High / Medium / Low ranking (change a rank only if
 your check shows it is wrong, and say so): the summary table, the details of
 High and Medium findings, what was not checked, and any references the
